@@ -3,6 +3,7 @@ import events from 'events';
 
 export const SP_TYPE_SEND_RESPONSE = 0;
 export const SP_TYPE_CHAR_COUNTING = 1;
+export const SP_TYPE_LINE_COUNTING = 2;
 
 const noop = () => {};
 
@@ -119,6 +120,60 @@ class SPCharCounting {
     }
 }
 
+// Line counting: the controller reports how many free line slots its receive buffer has
+// (e.g. the TinyG line mode footer), and lines are sent while the free slots, less the
+// lines waiting for a response, are more than the reserve kept for control commands.
+// With no free slots reported it sends one line at a time, like send-response.
+class SPLineCounting {
+    callback = null;
+
+    state = {
+      freeSlots: 0,
+      reserve: 2, // Defaults to 2
+    };
+
+    constructor(options, callback = noop) {
+      if (typeof options === 'function') {
+        callback = options;
+        options = {};
+      }
+
+      // reserve
+      const reserve = Number(options.reserve);
+      if (reserve >= 0) {
+        this.state.reserve = reserve;
+      }
+
+      if (typeof callback === 'function') {
+        this.callback = callback;
+      }
+    }
+
+    process() {
+      this.callback && this.callback(this);
+    }
+
+    clear() {
+      // The free slots describe the controller, not the program
+    }
+
+    get type() {
+      return SP_TYPE_LINE_COUNTING;
+    }
+
+    get freeSlots() {
+      return this.state.freeSlots;
+    }
+
+    set freeSlots(freeSlots) {
+      this.state.freeSlots = Number(freeSlots) || 0;
+    }
+
+    get reserve() {
+      return this.state.reserve;
+    }
+}
+
 class Sender extends events.EventEmitter {
     // streaming protocol
     sp = null;
@@ -143,9 +198,10 @@ class Sender extends events.EventEmitter {
 
     dataFilter = null;
 
-    // @param {number} [type] Streaming protocol type. 0 for send-response, 1 for character-counting.
+    // @param {number} [type] Streaming protocol type. 0 for send-response, 1 for character-counting, 2 for line-counting.
     // @param {object} [options] The options object.
     // @param {number} [options.bufferSize] The buffer size used in character-counting streaming protocol. Defaults to 127.
+    // @param {number} [options.reserve] The line slots kept free for control commands in line-counting streaming protocol. Defaults to 2.
     // @param {function} [options.dataFilter] A function to be used to handle the data. The function accepts two arguments: The data to be sent to the controller, and the context.
     constructor(type = SP_TYPE_SEND_RESPONSE, options = {}) {
       super();
@@ -153,6 +209,19 @@ class Sender extends events.EventEmitter {
       if (typeof options.dataFilter === 'function') {
         this.dataFilter = options.dataFilter;
       }
+
+      this.on('change', () => {
+        this.stateChanged = true;
+      });
+
+      this.setStreamingProtocol(type, options);
+    }
+
+    // Changes the streaming protocol. The loaded program and its progress are kept.
+    // @param {number} [type] Streaming protocol type. 0 for send-response, 1 for character-counting, 2 for line-counting.
+    // @param {object} [options] The options object (see the constructor).
+    setStreamingProtocol(type = SP_TYPE_SEND_RESPONSE, options = {}) {
+      this.sp = null;
 
       // character-counting
       if (type === SP_TYPE_CHAR_COUNTING) {
@@ -217,9 +286,42 @@ class Sender extends events.EventEmitter {
         });
       }
 
-      this.on('change', () => {
-        this.stateChanged = true;
-      });
+      // line-counting
+      if (type === SP_TYPE_LINE_COUNTING) {
+        this.sp = new SPLineCounting(options, (sp) => {
+          while (!this.state.hold && (this.state.sent < this.state.total)) {
+            // Remove leading and trailing whitespace from both ends of a string
+            let line = this.state.lines[this.state.sent].trim();
+
+            const inflight = this.state.sent - this.state.received;
+            if (inflight > 0) {
+              if (!(sp.freeSlots - inflight > sp.reserve)) {
+                break;
+              }
+
+              // Built-in commands (%) and expressions ([...]) are evaluated once every line sent
+              // before them has been answered, as they are in send-response
+              if ((line[0] === '%') || (line.indexOf('[') >= 0)) {
+                break;
+              }
+            }
+
+            if (this.dataFilter) {
+              line = this.dataFilter(line, this.state.context) || '';
+            }
+
+            this.state.sent++;
+            this.emit('change');
+
+            if (line.length === 0) {
+              this.ack(); // ack empty line
+              continue;
+            }
+
+            this.emit('data', line + '\n', this.state.context);
+          }
+        });
+      }
     }
 
     toJSON() {
