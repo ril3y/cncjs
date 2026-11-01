@@ -269,6 +269,7 @@ class Settings extends PureComponent {
 
           api.getState().then((res) => {
             const ignoreErrors = _get(res.body, 'controller.exception.ignoreErrors');
+            const tinygLineMode = _get(res.body, 'controller.tinyg.lineMode', true);
 
             const nextState = {
               ...this.state.controller,
@@ -279,6 +280,7 @@ class Settings extends PureComponent {
               },
               // followed by data
               ignoreErrors: !!ignoreErrors,
+              tinygLineMode: !!tinygLineMode,
             };
 
             this.initialState.controller = nextState;
@@ -313,6 +315,9 @@ class Settings extends PureComponent {
             controller: {
               exception: {
                 ignoreErrors: this.state.controller.ignoreErrors,
+              },
+              tinyg: {
+                lineMode: this.state.controller.tinygLineMode,
               },
             }
           };
@@ -355,6 +360,14 @@ class Settings extends PureComponent {
             controller: {
               ...state.controller,
               ignoreErrors: !state.controller.ignoreErrors
+            }
+          }));
+        },
+        toggleTinyGLineMode: () => {
+          this.setState(state => ({
+            controller: {
+              ...state.controller,
+              tinygLineMode: !state.controller.tinygLineMode
             }
           }));
         },
@@ -1151,6 +1164,7 @@ class Settings extends PureComponent {
             saving: false
           },
           ignoreErrors: false,
+          tinygLineMode: true,
         },
         // Commands
         commands: {

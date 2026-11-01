@@ -15,12 +15,17 @@ class Controller extends PureComponent {
 
     fields = {
       ignoreErrors: null,
+      tinygLineMode: null,
     };
 
     handlers = {
       handleChangeIgnoreErrors: (event) => {
         const { actions } = this.props;
         actions.toggleIgnoreErrors();
+      },
+      handleChangeTinyGLineMode: (event) => {
+        const { actions } = this.props;
+        actions.toggleTinyGLineMode();
       },
       cancel: (event) => {
         const { actions } = this.props;
@@ -78,6 +83,29 @@ class Controller extends PureComponent {
                     </span>
                     <Space width="4" />
                     <span>{i18n._('Enabling this option may cause machine damage if you don\'t have an Emergency Stop button to prevent a dangerous situation.')}</span>
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style={{ marginBottom: 24 }}>
+            <h5>{i18n._('TinyG')}</h5>
+            <div className={styles.formFields}>
+              <div className={styles.formGroup}>
+                <div className="checkbox">
+                  <label>
+                    <input
+                      ref={(node) => {
+                        this.fields.tinygLineMode = node;
+                      }}
+                      type="checkbox"
+                      checked={state.tinygLineMode}
+                      onChange={this.handlers.handleChangeTinyGLineMode}
+                    />
+                    {i18n._('Stream G-code in line mode with firmware build 446 or later')}
+                  </label>
+                  <p style={{ marginLeft: 20 }}>
+                    <span>{i18n._('Keeps several lines in the receive buffer of the controller. Takes effect on the next connection.')}</span>
                   </p>
                 </div>
               </div>

@@ -643,5 +643,8 @@
   "None": "無",
   "WebGL:": "WebGL:",
   "Drop files to upload": "將檔案拖曳至此處上傳",
-  "Uploading...": "正在上傳..."
+  "Uploading...": "正在上傳...",
+  "TinyG": "",
+  "Stream G-code in line mode with firmware build 446 or later": "",
+  "Keeps several lines in the receive buffer of the controller. Takes effect on the next connection.": ""
 }
