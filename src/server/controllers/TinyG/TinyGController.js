@@ -55,6 +55,7 @@ import {
   TINYG_PLANNER_BUFFER_LOW_WATER_MARK,
   TINYG_PLANNER_BUFFER_HIGH_WATER_MARK,
   TINYG_SERIAL_BUFFER_LIMIT,
+  TINYG_SETUP_RESPONSE_TIMEOUT,
   TINYG_STATUS_CODES
 } from './constants';
 
@@ -909,21 +910,46 @@ class TinyGController {
 
     // https://github.com/synthetos/TinyG/wiki/TinyG-Configuration-for-Firmware-Version-0.97
     async initController() {
-      const send = (cmd = '') => {
+      // Every JSON command returns one response with a footer. Settings are written to EEPROM
+      // with interrupts disabled, so the next command is sent only after the reply to the
+      // previous one ("always run configuration commands synchronously" - Tinyg Communications
+      // Programming). A missing reply times out so that a silent board cannot hang the setup.
+      const waitForResponse = (timeout) => new Promise((resolve) => {
+        const runner = this.runner;
+        let timer = null;
+        const onFooter = (f) => {
+          clearTimeout(timer);
+          runner.removeListener('f', onFooter);
+          resolve(f);
+        };
+        timer = setTimeout(() => {
+          runner.removeListener('f', onFooter);
+          resolve(null);
+        }, timeout);
+        runner.on('f', onFooter);
+      });
+      const send = async (cmd = '') => {
         if (this.isClose()) {
           // Serial port is closed
-          return;
+          return null;
         }
 
         cmd = String(cmd);
 
         if (cmd.length >= TINYG_SERIAL_BUFFER_LIMIT) {
           log.error(`Exceeded serial buffer limit (${TINYG_SERIAL_BUFFER_LIMIT}): cmd=${cmd}`);
-          return;
+          return null;
         }
 
         log.silly(`init: ${cmd} ${cmd.length}`);
+        const response = waitForResponse(TINYG_SETUP_RESPONSE_TIMEOUT);
         this.command('gcode', cmd);
+
+        const f = await response;
+        if (!f) {
+          log.warn(`No response within ${TINYG_SETUP_RESPONSE_TIMEOUT}ms: cmd=${cmd}`);
+        }
+        return f;
       };
       const relaxedJSON = (json) => {
         if (typeof json === 'object') {
@@ -934,45 +960,36 @@ class TinyGController {
 
       // Enable JSON mode
       // 0=text mode, 1=JSON mode
-      send('{ej:1}');
+      await send('{ej:1}');
 
       // JSON verbosity
       // 0=silent, 1=footer, 2=messages, 3=configs, 4=linenum, 5=verbose
-      send('{jv:4}');
+      await send('{jv:4}');
 
       // Queue report verbosity
       // 0=off, 1=filtered, 2=verbose
-      send('{qv:1}');
+      await send('{qv:1}');
 
       // Status report verbosity
       // 0=off, 1=filtered, 2=verbose
-      send('{sv:1}');
+      await send('{sv:1}');
 
       // Status report interval
       // Set the status interval to 200ms
-      send('{si:200}');
+      await send('{si:200}');
 
       // Check whether the spindle and coolant commands are supported
-      await delay(100);
-      send('{spe:n}');
-      await delay(100);
-      send('{spd:n}');
-      await delay(100);
-      send('{spc:n}');
-      await delay(100);
-      send('{sps:n}');
-      await delay(100);
-      send('{com:n}');
-      await delay(100);
-      send('{cof:n}');
-
-      // Wait for a certain amount of time before setting status report fields
-      await delay(200);
+      await send('{spe:n}');
+      await send('{spd:n}');
+      await send('{spc:n}');
+      await send('{sps:n}');
+      await send('{com:n}');
+      await send('{cof:n}');
 
       // Settings Status Report Fields
       // https://github.com/synthetos/TinyG/wiki/TinyG-Status-Reports#setting-status-report-fields
       // Note: The JSON string is minified to make sure the length won't exceed the serial buffer limit
-      send(relaxedJSON({
+      await send(relaxedJSON({
         // Returns an object composed of the picked properties
         sr: _.pickBy(this.sr, (value, key) => {
           return !!value;
@@ -980,19 +997,23 @@ class TinyGController {
       }));
 
       // Request system settings
-      send('{sys:n}');
+      await send('{sys:n}');
 
       // Request motor timeout
-      send('{mt:n}');
+      await send('{mt:n}');
 
       // Request motor states
-      send('{pwr:n}');
+      await send('{pwr:n}');
 
       // Request queue report
-      send('{qr:n}');
+      await send('{qr:n}');
 
       // Request status report
-      send('{sr:n}');
+      await send('{sr:n}');
+
+      if (this.isClose()) {
+        return;
+      }
 
       await delay(50);
       this.event.trigger('controller:ready');

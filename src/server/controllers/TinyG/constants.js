@@ -12,6 +12,9 @@ export const TINYG_PLANNER_BUFFER_HIGH_WATER_MARK = 7;
 // TinyG has a 254 byte serial buffer that receives raw ASCII commands.
 export const TINYG_SERIAL_BUFFER_LIMIT = 254;
 
+// How long to wait for the reply to each connect-time setup command (in milliseconds)
+export const TINYG_SETUP_RESPONSE_TIMEOUT = 1000;
+
 // Machine State
 // https://github.com/synthetos/g2/wiki/Status-Reports#stat-values
 export const TINYG_MACHINE_STATE_INITIALIZING = 0; // Machine is initializing

@@ -111,6 +111,35 @@ const tempFile = (name) => {
   return file;
 };
 
+// Answers each line written to the board with reply(line) on a later tick, the way the
+// board replies over the serial port, and counts the lines still waiting for a reply.
+const respondToWrites = (controller, writes, reply) => {
+  const stats = { outstanding: 0, maxOutstanding: 0 };
+  controller.connection.write = (data) => {
+    writes.push({ data });
+    const response = reply(String(data).trim());
+    if (!response) {
+      return;
+    }
+    stats.outstanding++;
+    stats.maxOutstanding = Math.max(stats.maxOutstanding, stats.outstanding);
+    setImmediate(() => {
+      stats.outstanding--;
+      if (controller.runner) {
+        controller.runner.parse(response);
+      }
+    });
+  };
+  return stats;
+};
+
+const setupCommands = [
+  '{ej:1}', '{jv:4}', '{qv:1}', '{sv:1}', '{si:200}',
+  '{spe:n}', '{spd:n}', '{spc:n}', '{sps:n}', '{com:n}', '{cof:n}',
+  expect.stringMatching(/^{sr:{stat:t,/),
+  '{sys:n}', '{mt:n}', '{pwr:n}', '{qr:n}', '{sr:n}',
+];
+
 const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) => [
   'G4 P0.5',
   'M5',
@@ -888,6 +917,27 @@ describe('TinyGController', () => {
       controller.command('autolevel:applyProbeCompensation', { gcode: 'M5\nG90', probeData }, callback);
 
       expect(callback).toHaveBeenCalledWith(null, { compensatedGcode: 'M5\nG90' });
+    });
+  });
+
+  describe('connect-time setup', () => {
+    test('sends each setup command only after the reply to the previous one', async () => {
+      const { controller, writes } = setupController();
+      const stats = respondToWrites(controller, writes, () => '{"r":{},"f":[1,0,5]}');
+
+      await controller.initController();
+
+      expect(data(writes).map((line) => line.trim())).toEqual(setupCommands);
+      expect(stats.maxOutstanding).toBe(1);
+    });
+
+    test('a command without a reply times out and the setup continues', async () => {
+      const { controller, writes } = setupController();
+      respondToWrites(controller, writes, (line) => ((line === '{spe:n}') ? null : '{"r":{},"f":[1,0,5]}'));
+
+      await controller.initController();
+
+      expect(data(writes).map((line) => line.trim())).toEqual(setupCommands);
     });
   });
 
