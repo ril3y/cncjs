@@ -150,6 +150,55 @@ describe('TinyGRunner', () => {
   });
 
   describe('receive reports', () => {
+    test.each([
+      ['clean', '{"r":{"n":104},"f":[3,0,9]}'],
+      ['leading XOFF', '\x13{"r":{"n":104},"f":[3,0,9]}'],
+      ['embedded XON', '{"r":{"n":104},"f":\x11[3,0,9]}'],
+      ['trailing controls', '{"r":{"n":104},"f":[3,0,9]}\x11\x13'],
+      // Exact bytes of the unanswered N104 in the serial capture.
+      ['captured N104', '\x13{"r":{"n":104},"f":\x11[3,0,9]}'],
+    ])('preserves the response and footer with %s', (name, wire) => {
+      const runner = new TinyGRunner();
+      const response = jest.fn();
+      const footer = jest.fn();
+      const raw = jest.fn();
+      runner.on('r', response);
+      runner.on('f', footer);
+      runner.on('raw', raw);
+
+      runner.parse(wire);
+
+      expect(response.mock.calls).toEqual([[{ n: 104 }]]);
+      expect(footer.mock.calls).toEqual([[[3, 0, 9]]]);
+      expect(runner.footer).toEqual({ revision: 3, statusCode: 0, rxBufferInfo: 9 });
+      expect(raw).toHaveBeenCalledWith({ raw: wire });
+    });
+
+    test('keeps escaped control characters in JSON string values', () => {
+      const runner = new TinyGRunner();
+      const response = jest.fn();
+      runner.on('r', response);
+
+      runner.parse('{"r":{"msg":"\\u0011\\u0013"},"f":[3,0,9]}');
+
+      expect(response).toHaveBeenCalledWith({ msg: '\x11\x13' });
+    });
+
+    test('control bytes alone or malformed JSON do not acknowledge a line', () => {
+      const runner = new TinyGRunner();
+      const response = jest.fn();
+      const footer = jest.fn();
+      runner.on('r', response);
+      runner.on('f', footer);
+
+      runner.parse('\x11\x13');
+      runner.parse('{"r":{"n":104},"f":\x18[3,0,9]}');
+      runner.parse('\x13{"r":{"n":104},"f":\x11[3,0,9]');
+
+      expect(response).not.toHaveBeenCalled();
+      expect(footer).not.toHaveBeenCalled();
+    });
+
     test('should parse receive report with footer', () => {
       return new Promise((resolve) => {
         const runner = new TinyGRunner();
