@@ -939,6 +939,69 @@ describe('TinyGController', () => {
 
       expect(data(writes).map((line) => line.trim())).toEqual(setupCommands);
     });
+
+    // In ALARM a SET is answered with status 204 (newer firmware) and a GET still works.
+    const alarmReply = (board) => (line) => {
+      if (line === '{sr:n}') {
+        return `{"r":{"sr":{"stat":${board.stat}}},"f":[1,0,6]}`;
+      }
+      const isSet = !/:n}$/.test(line);
+      return `{"r":{},"f":[1,${(isSet && board.stat === 2) ? 204 : 0},5]}`;
+    };
+
+    test('settings rejected in ALARM are applied again after the alarm is cleared, without clearing it', async () => {
+      const { controller, writes, events } = setupController();
+      const board = { stat: 2 };
+      respondToWrites(controller, writes, alarmReply(board));
+      const trigger = jest.spyOn(controller.event, 'trigger');
+
+      await controller.initController();
+
+      expect(controller.setup.rejected).toBe(true);
+      expect(events.some((entry) => entry.event === 'serialport:read' && /ALARM/.test(entry.args[0]))).toBe(true);
+      expect(data(writes).some((line) => /clear/.test(line))).toBe(false);
+      expect(trigger).toHaveBeenCalledWith('controller:ready');
+
+      // Still in ALARM: nothing is sent
+      const sentInAlarm = writes.length;
+      controller.runner.parse('{"sr":{"stat":2}}');
+      expect(writes).toHaveLength(sentInAlarm);
+
+      // The user clears the alarm: the setup runs again
+      const initController = jest.spyOn(controller, 'initController');
+      trigger.mockClear();
+      board.stat = 1;
+      controller.runner.parse('{"sr":{"stat":1}}');
+      expect(initController).toHaveBeenCalledWith({ reapply: true });
+      await initController.mock.results[0].value;
+
+      expect(data(writes).slice(sentInAlarm).map((line) => line.trim())).toEqual(setupCommands);
+      expect(controller.setup.rejected).toBe(false);
+      expect(trigger).not.toHaveBeenCalledWith('controller:ready');
+    });
+
+    test('settings ignored in ALARM without an error status (build 449) are detected from the machine state', async () => {
+      const { controller, writes } = setupController();
+      respondToWrites(controller, writes, (line) => ((line === '{sr:n}')
+        ? '{"r":{"sr":{"stat":2}},"f":[1,0,6]}'
+        : '{"r":{},"f":[1,0,5]}'));
+
+      await controller.initController();
+
+      expect(controller.setup.rejected).toBe(true);
+    });
+
+    test('a board that is not in ALARM is not set up again', async () => {
+      const { controller, writes } = setupController();
+      respondToWrites(controller, writes, alarmReply({ stat: 1 }));
+
+      await controller.initController();
+      const count = writes.length;
+      controller.runner.parse('{"sr":{"stat":3}}');
+
+      expect(controller.setup.rejected).toBe(false);
+      expect(writes).toHaveLength(count);
+    });
   });
 
   describe('negative cases', () => {

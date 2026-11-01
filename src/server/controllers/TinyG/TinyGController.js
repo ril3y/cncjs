@@ -52,6 +52,8 @@ import { in2mm, mapPositionToUnits, mapValueToUnits } from '../utils/units';
 import TinyGRunner from './TinyGRunner';
 import {
   TINYG,
+  TINYG_MACHINE_STATE_ALARM,
+  TINYG_MACHINE_STATE_SHUTDOWN,
   TINYG_PLANNER_BUFFER_LOW_WATER_MARK,
   TINYG_PLANNER_BUFFER_HIGH_WATER_MARK,
   TINYG_SERIAL_BUFFER_LIMIT,
@@ -164,6 +166,14 @@ class TinyGController {
     energizeMotorsTimer = null;
 
     blocked = false;
+
+    // Connect-time setup (initController)
+    setup = {
+      running: false,
+      // The settings were rejected because the board was in ALARM. They are applied again
+      // once the user clears the alarm.
+      rejected: false,
+    };
 
     senderStatus = SENDER_STATUS_NONE;
 
@@ -801,6 +811,12 @@ class TinyGController {
       });
 
       this.runner.on('sr', (sr) => {
+        // The board has left the ALARM state that rejected the connect-time setup
+        if (this.setup.rejected && !this.setup.running && this.runner.isIdle()) {
+          log.debug('The alarm has been cleared: applying the controller setup again');
+          this.setup.rejected = false;
+          this.initController({ reapply: true });
+        }
       });
 
       this.runner.on('fb', (fb) => {
@@ -909,11 +925,14 @@ class TinyGController {
     }
 
     // https://github.com/synthetos/TinyG/wiki/TinyG-Configuration-for-Firmware-Version-0.97
-    async initController() {
+    async initController(options) {
+      const { reapply = false } = { ...options };
+
       // Every JSON command returns one response with a footer. Settings are written to EEPROM
       // with interrupts disabled, so the next command is sent only after the reply to the
       // previous one ("always run configuration commands synchronously" - Tinyg Communications
       // Programming). A missing reply times out so that a silent board cannot hang the setup.
+      let rejected = false;
       const waitForResponse = (timeout) => new Promise((resolve) => {
         const runner = this.runner;
         let timer = null;
@@ -949,6 +968,10 @@ class TinyGController {
         if (!f) {
           log.warn(`No response within ${TINYG_SETUP_RESPONSE_TIMEOUT}ms: cmd=${cmd}`);
         }
+        if (f && [204, 205].includes(Number(f[1]))) {
+          // 204: Command rejected by ALARM, 205: Command rejected by SHUTDOWN
+          rejected = true;
+        }
         return f;
       };
       const relaxedJSON = (json) => {
@@ -957,6 +980,8 @@ class TinyGController {
         }
         return json.replace(/"/g, '').replace(/true/g, 't');
       };
+
+      this.setup.running = true;
 
       // Enable JSON mode
       // 0=text mode, 1=JSON mode
@@ -1011,7 +1036,23 @@ class TinyGController {
       // Request status report
       await send('{sr:n}');
 
+      this.setup.running = false;
+
       if (this.isClose()) {
+        return;
+      }
+
+      // Settings are rejected while the board is in ALARM or SHUTDOWN: newer firmware replies with
+      // status 204 or 205, build 449 and earlier ignore them without an error. The alarm is not
+      // cleared here; the settings are applied again after the user clears it (see the 'sr' handler).
+      const machineState = _.get(this.runner.state, 'sr.machineState');
+      if (rejected || [TINYG_MACHINE_STATE_ALARM, TINYG_MACHINE_STATE_SHUTDOWN].includes(machineState)) {
+        this.setup.rejected = true;
+        log.warn(`Settings were not applied in machine state ${machineState}; they will be applied after the alarm is cleared`);
+        this.emit('serialport:read', 'TinyG is in ALARM: the settings will be applied after the alarm is cleared');
+      }
+
+      if (reapply) {
         return;
       }
 
