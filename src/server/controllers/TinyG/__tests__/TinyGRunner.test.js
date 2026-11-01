@@ -167,5 +167,17 @@ describe('TinyGRunner', () => {
         runner.parse('{"r":{},"f":[1,0,4]}');
       });
     });
+
+    test('should update the footer before emitting the response', () => {
+      const runner = new TinyGRunner();
+      const footers = [];
+      runner.on('r', () => {
+        footers.push({ ...runner.footer });
+      });
+
+      runner.parse('{"r":{"n":7},"f":[3,0,9]}');
+
+      expect(footers).toEqual([{ revision: 3, statusCode: 0, rxBufferInfo: 9 }]);
+    });
   });
 });

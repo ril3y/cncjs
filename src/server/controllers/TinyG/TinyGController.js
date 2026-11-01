@@ -13,7 +13,7 @@ import SerialConnection from '../../lib/SerialConnection';
 import EventTrigger from '../../lib/EventTrigger';
 import Feeder from '../../lib/Feeder';
 import MessageSlot from '../../lib/MessageSlot';
-import Sender, { SP_TYPE_SEND_RESPONSE } from '../../lib/Sender';
+import Sender, { SP_TYPE_LINE_COUNTING, SP_TYPE_SEND_RESPONSE } from '../../lib/Sender';
 import Workflow, {
   WORKFLOW_STATE_IDLE,
   WORKFLOW_STATE_PAUSED,
@@ -52,6 +52,8 @@ import { in2mm, mapPositionToUnits, mapValueToUnits } from '../utils/units';
 import TinyGRunner from './TinyGRunner';
 import {
   TINYG,
+  TINYG_LINE_MODE_MIN_FIRMWARE_BUILD,
+  TINYG_LINE_MODE_RESERVE,
   TINYG_MACHINE_STATE_ALARM,
   TINYG_MACHINE_STATE_SHUTDOWN,
   TINYG_PLANNER_BUFFER_LOW_WATER_MARK,
@@ -176,6 +178,12 @@ class TinyGController {
     };
 
     senderStatus = SENDER_STATUS_NONE;
+
+    // RX line mode ({rxm:1}) was enabled at connect: lines are streamed with several in flight
+    lineMode = false;
+
+    // The line number (n) of the last program line answered in line mode
+    responseLineNumber = 0;
 
     actionTime = {
       energizeMotors: 0,
@@ -705,6 +713,25 @@ class TinyGController {
 
         if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
           const n = _.get(r, 'r.n') || _.get(r, 'n');
+
+          // Line mode: several lines are in flight, paced by the free line slots in the response footer.
+          // The planner queue reports do not block acknowledgements here: a board whose planner is full
+          // stops reading lines, and the free line slots it reports drop.
+          if (this.lineMode) {
+            const ignoreErrors = config.get('state.controller.exception.ignoreErrors');
+            const pauseError = (this.runner.footer.statusCode !== 0) && !ignoreErrors;
+            log.silly(`ack: n=${n}, hold=${hold}, sent=${sent}, received=${received}, free=${this.runner.footer.rxBufferInfo}`);
+            this.responseLineNumber = n;
+            this.updateFreeSlots();
+            this.sender.ack();
+            if (!pauseError) {
+              // On an error the 'f' handler pauses the program: send nothing past the failed line
+              this.sender.next();
+            }
+            this.senderStatus = SENDER_STATUS_NEXT;
+            return;
+          }
+
           if (n !== sent) {
             log.warn(`Expression: n (${n}) === sent (${sent})`);
           }
@@ -730,7 +757,7 @@ class TinyGController {
             log.debug(`Stop sending G-code: hold=${hold}, sent=${sent}, received=${received + 1}`);
           }
           const n = _.get(r, 'r.n') || _.get(r, 'n');
-          if (n !== sent) {
+          if (!this.lineMode && (n !== sent)) {
             log.warn(`Expression: n (${n}) === sent (${sent})`);
           }
           log.silly(`ack: n=${n}, blocked=${this.blocked}, hold=${hold}, sent=${sent}, received=${received}`);
@@ -826,6 +853,10 @@ class TinyGController {
       });
 
       this.runner.on('f', (f) => {
+        const responseLineNumber = this.responseLineNumber;
+        this.responseLineNumber = 0;
+        this.updateFreeSlots();
+
         // https://github.com/synthetos/g2/wiki/Status-Codes
         const statusCode = f[1] || 0;
 
@@ -837,8 +868,10 @@ class TinyGController {
             const ignoreErrors = config.get('state.controller.exception.ignoreErrors');
             const pauseError = !ignoreErrors;
             const { lines, received } = this.sender.state;
-            const line = ensureString(lines[received - 1]).trim();
-            const ln = received + 1;
+            // In line mode the failed line is the one numbered n, not necessarily the last line answered
+            const index = (this.lineMode && responseLineNumber > 0) ? (responseLineNumber - 1) : (received - 1);
+            const line = ensureString(lines[index]).trim();
+            const ln = index + 2;
 
             this.emit('serialport:read', `> ${line} (ln=${ln})`);
             this.emit('serialport:read', `error:${code} (${error.msg})`);
@@ -1024,6 +1057,29 @@ class TinyGController {
       // Request system settings
       await send('{sys:n}');
 
+      if (this.isClose()) {
+        return;
+      }
+
+      // RX line (packet) mode, firmware build 446.xx and later: the board queues whole lines and
+      // every response footer becomes [3, status, free line slots] ("Sending Data to TinyG using RX
+      // Packet Mode"). rxm is a persisted setting. Status 0 does not prove the board switched: build
+      // 449 ignores settings in ALARM, so the footer revision is checked again on every response.
+      this.lineMode = false;
+      const lineModeEnabled = config.get('state.controller.tinyg.lineMode', true);
+      const firmwareBuild = ensureNumber(_.get(this.runner.settings, 'fb'));
+      if (lineModeEnabled && (firmwareBuild >= TINYG_LINE_MODE_MIN_FIRMWARE_BUILD)) {
+        const f = await send('{rxm:1}');
+        this.lineMode = !!f && (Number(f[1]) === 0);
+      }
+      this.sender.setStreamingProtocol(this.lineMode ? SP_TYPE_LINE_COUNTING : SP_TYPE_SEND_RESPONSE, {
+        reserve: TINYG_LINE_MODE_RESERVE,
+      });
+      if (this.lineMode) {
+        // Request the free line slots
+        await send('{rx:n}');
+      }
+
       // Request motor timeout
       await send('{mt:n}');
 
@@ -1058,6 +1114,16 @@ class TinyGController {
 
       await delay(50);
       this.event.trigger('controller:ready');
+    }
+
+    // A line mode footer is [3, status, free line slots]. A character mode footer, [2, status, bytes],
+    // carries no slot count, and the sender then sends one line at a time.
+    updateFreeSlots() {
+      if (!this.lineMode) {
+        return;
+      }
+      const { revision, rxBufferInfo } = this.runner.footer;
+      this.sender.sp.freeSlots = (revision === 3) ? rxBufferInfo : 0;
     }
 
     populateContext(context) {

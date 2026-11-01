@@ -150,6 +150,13 @@ class TinyGRunner extends events.EventEmitter {
         const result = this.parser.parse(data) || {};
         const { type, payload } = result;
 
+        // Update the footer first so that handlers of the response see its footer
+        if (payload.f && payload.f.length > 0) {
+          this.footer.revision = payload.f[0];
+          this.footer.statusCode = payload.f[1];
+          this.footer.rxBufferInfo = payload.f[2];
+        }
+
         if (type === TinyGLineParserResultMotorTimeout) {
           const { mt = this.state.mt } = payload;
 
@@ -457,9 +464,6 @@ class TinyGRunner extends events.EventEmitter {
         }
 
         if (payload.f && payload.f.length > 0) {
-          this.footer.revision = payload.f[0];
-          this.footer.statusCode = payload.f[1];
-          this.footer.rxBufferInfo = payload.f[2];
           this.emit('f', payload.f);
         }
       }

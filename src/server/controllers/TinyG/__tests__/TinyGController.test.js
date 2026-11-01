@@ -16,6 +16,7 @@ import {
   WRITE_SOURCE_CLIENT,
   WRITE_SOURCE_FEEDER,
 } from '../../constants';
+import { SP_TYPE_LINE_COUNTING, SP_TYPE_SEND_RESPONSE } from '../../../lib/Sender';
 import { createController } from '../../__tests__/helpers/createController';
 
 let controllers = [];
@@ -1001,6 +1002,202 @@ describe('TinyGController', () => {
 
       expect(controller.setup.rejected).toBe(false);
       expect(writes).toHaveLength(count);
+    });
+  });
+
+  describe('line mode', () => {
+    const program = Array.from({ length: 20 }, (v, i) => `G1 X${i}`).join('\n');
+
+    // An idle board with firmware build `fb`; once {rxm:1} is set, every footer reports `free` line slots
+    const boardReply = ({ fb = 449.01, rxm = 0 }) => {
+      const board = { rxm, free: 10 };
+      const footer = (status = 0) => (board.rxm ? `[3,${status},${board.free}]` : `[1,${status},5]`);
+      return (line) => {
+        if (line === '{sys:n}') {
+          return `{"r":{"sys":{"fb":${fb},"fv":0.97}},"f":${footer()}}`;
+        }
+        if (line === '{rxm:1}') {
+          board.rxm = 1;
+          return `{"r":{"rxm":1},"f":${footer()}}`;
+        }
+        if (line === '{rx:n}') {
+          return `{"r":{"rx":${board.free}},"f":${footer()}}`;
+        }
+        if (line === '{sr:n}') {
+          return `{"r":{"sr":{"stat":1}},"f":${footer()}}`;
+        }
+        return `{"r":{},"f":${footer()}}`;
+      };
+    };
+
+    const connect = async (controller, writes, options = {}) => {
+      respondToWrites(controller, writes, boardReply(options));
+      await controller.initController();
+      // From here on the test answers the program lines itself
+      controller.connection.write = (data) => writes.push({ data });
+      writes.length = 0;
+    };
+
+    const respond = (controller, n, free, status = 0) => {
+      controller.runner.parse(`{"r":{"n":${n}},"f":[3,${status},${free}]}`);
+    };
+
+    test.each([
+      [440.21, false],
+      [445.99, false],
+      [446.01, true],
+      [449.01, true],
+      [101.02, false], // g2core
+    ])('firmware build %p enables line mode: %p', async (fb, enabled) => {
+      const { controller, writes } = setupController();
+      respondToWrites(controller, writes, boardReply({ fb }));
+
+      await controller.initController();
+
+      const lines = data(writes).map((line) => line.trim());
+      expect(lines.includes('{rxm:1}')).toBe(enabled);
+      expect(lines.includes('{rx:n}')).toBe(enabled);
+      expect(controller.lineMode).toBe(enabled);
+      expect(controller.sender.sp.type).toBe(enabled ? SP_TYPE_LINE_COUNTING : SP_TYPE_SEND_RESPONSE);
+      if (enabled) {
+        expect(controller.sender.sp.freeSlots).toBe(10);
+        expect(lines.indexOf('{rxm:1}')).toBeGreaterThan(lines.indexOf('{sys:n}'));
+      }
+    });
+
+    test('line mode is not enabled when the setting turns it off', async () => {
+      const { controller, writes } = setupController({ 'state.controller.tinyg.lineMode': false });
+      respondToWrites(controller, writes, boardReply({ fb: 449.01 }));
+
+      await controller.initController();
+
+      expect(data(writes).map((line) => line.trim())).toEqual(setupCommands);
+      expect(controller.lineMode).toBe(false);
+      expect(controller.sender.sp.type).toBe(SP_TYPE_SEND_RESPONSE);
+    });
+
+    test('line mode is not enabled when the board rejects {rxm:1}', async () => {
+      const { controller, writes } = setupController();
+      const reply = boardReply({ fb: 449.01 });
+      respondToWrites(controller, writes, (line) => ((line === '{rxm:1}') ? '{"r":{},"f":[1,204,5]}' : reply(line)));
+
+      await controller.initController();
+
+      expect(controller.lineMode).toBe(false);
+      expect(controller.sender.sp.type).toBe(SP_TYPE_SEND_RESPONSE);
+    });
+
+    test('a connection closed during the setup ends it quietly', async () => {
+      const { controller, writes } = setupController();
+      const reply = boardReply({ fb: 449.01 });
+      respondToWrites(controller, writes, (line) => {
+        if (line === '{sys:n}') {
+          controller.destroy();
+        }
+        return reply(line);
+      });
+
+      await expect(controller.initController()).resolves.toBeUndefined();
+      expect(data(writes).map((line) => line.trim()).pop()).toBe('{sys:n}');
+    });
+
+    test('streams several lines in flight, paced by the free line slots in each response footer', async () => {
+      const { controller, writes } = setupController();
+      await connect(controller, writes);
+
+      controller.command('gcode:load', 'test.nc', program);
+      controller.command('gcode:start');
+
+      // 10 free slots, 2 kept for control commands
+      expect(data(writes)).toEqual(Array.from({ length: 8 }, (v, i) => `N${i + 1}G1X${i}\n`));
+
+      // The board is filling up: 4 free slots, 7 lines in flight
+      respond(controller, 1, 4);
+      expect(writes).toHaveLength(8);
+
+      // The board has caught up: 10 free slots, 6 lines in flight
+      respond(controller, 2, 10);
+      expect(data(writes).slice(8)).toEqual(['N9G1X8\n', 'N10G1X9\n']);
+      expect(controller.sender.state.received).toBe(2);
+      expect(controller.sender.state.sent).toBe(10);
+
+      // Queue reports do not block acknowledgements in line mode
+      controller.runner.parse('{"qr":3}');
+      expect(controller.blocked).toBe(true);
+      respond(controller, 3, 10);
+      expect(controller.sender.state.received).toBe(3);
+      expect(writes).toHaveLength(11);
+    });
+
+    test('a character mode footer falls back to one line at a time', async () => {
+      const { controller, writes } = setupController();
+      await connect(controller, writes);
+      controller.runner.parse('{"r":{},"f":[2,0,25]}');
+
+      controller.command('gcode:load', 'test.nc', program);
+      controller.command('gcode:start');
+      expect(writes).toHaveLength(1);
+
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,9]}');
+      expect(writes).toHaveLength(2);
+    });
+
+    test('an error pauses the program, sends nothing past it and reports the failed line', async () => {
+      const { controller, writes, events } = setupController();
+      await connect(controller, writes);
+
+      controller.command('gcode:load', 'test.nc', program);
+      controller.command('gcode:start');
+      respond(controller, 1, 10);
+      expect(writes).toHaveLength(9);
+
+      respond(controller, 2, 10, 108);
+
+      expect(writes).toHaveLength(9);
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      const reads = events.filter((entry) => entry.event === 'serialport:read').map((entry) => entry.args[0]);
+      expect(reads).toContain('> G1 X1 (ln=3)');
+    });
+
+    test('pause holds the sender while the lines in flight are answered, and resume refills the board', async () => {
+      const { controller, writes } = setupController();
+      await connect(controller, writes);
+
+      controller.command('gcode:load', 'test.nc', program);
+      controller.command('gcode:start');
+      controller.command('gcode:pause');
+      expect(data(writes).slice(8)).toEqual(['!\n', '{"qr":""}\n']);
+
+      for (let n = 1; n <= 8; n++) {
+        respond(controller, n, 10);
+      }
+      expect(writes).toHaveLength(10);
+      expect(controller.sender.state.received).toBe(8);
+
+      controller.command('gcode:resume');
+      expect(data(writes).slice(10)).toEqual([
+        '~\n',
+        ...Array.from({ length: 8 }, (v, i) => `N${i + 9}G1X${i + 8}\n`),
+        '{"qr":""}\n',
+      ]);
+    });
+
+    test('a program runs to completion with every line answered', async () => {
+      const { controller, writes } = setupController();
+      await connect(controller, writes);
+
+      controller.command('gcode:load', 'test.nc', program);
+      controller.command('gcode:start');
+      for (let n = 1; n <= 20; n++) {
+        respond(controller, n, 10);
+      }
+
+      // The trailing %wait is sent on its own once every program line is answered
+      expect(data(writes)[20]).toBe('N21G4P0.5\n');
+      expect(writes).toHaveLength(21);
+      respond(controller, 21, 10);
+      controller.runner.parse('{"qr":28}');
+      expect(controller.sender.state.received).toBe(controller.sender.state.total);
     });
   });
 
