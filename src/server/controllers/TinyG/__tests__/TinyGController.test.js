@@ -1129,6 +1129,44 @@ describe('TinyGController', () => {
       expect(writes).toHaveLength(11);
     });
 
+    test('finishes a line-mode job with XON/XOFF inside a reply and interleaved queue reports', async () => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'setTimeout', 'clearTimeout'] });
+      try {
+        const { controller, writes } = setupController();
+        await connect(controller, writes);
+        controller.ready = true; // The serial connection helper bypasses open().
+        const lines = Array.from({ length: 110 }, (v, i) => (
+          [0, 49, 99].includes(i) ? '(comment only)' : `G1 X${i % 20}`
+        ));
+        controller.command('gcode:load', 'flow-control.nc', lines.join('\n'));
+        controller.command('gcode:start');
+        let capturedReply = false;
+
+        // Answer only lines actually sent, including the trailing wait once it is released.
+        for (let i = 0; i < writes.length; i++) {
+          const n = Number(data(writes)[i].match(/^N(\d+)/)[1]);
+          controller.connectionEventListener.data('{"qr":23}');
+          if (n === 104) {
+            capturedReply = true;
+            controller.connectionEventListener.data('\x13{"r":{"n":104},"f":\x11[3,0,9]}');
+          } else {
+            controller.connectionEventListener.data(`{"r":{"n":${n}},"f":[3,0,10]}`);
+          }
+        }
+
+        expect(capturedReply).toBe(true);
+        expect(data(writes).pop()).toBe('N111G4P0.5\n');
+        expect(writes).toHaveLength(108); // 110 input lines - 3 comments + final wait
+        expect(controller.sender.state.received).toBe(controller.sender.state.total);
+        expect(controller.actionTime.senderFinishTime).toBeGreaterThan(0);
+        controller.connectionEventListener.data('{"sr":{"stat":3}}');
+        jest.advanceTimersByTime(1000);
+        expect(controller.workflow.state).toBe(WORKFLOW_STATE_IDLE);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     test('a character mode footer falls back to one line at a time', async () => {
       const { controller, writes } = setupController();
       await connect(controller, writes);

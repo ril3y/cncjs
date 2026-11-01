@@ -140,6 +140,10 @@ class TinyGRunner extends events.EventEmitter {
 
       this.emit('raw', { raw: data });
 
+      // Flow-control bytes can arrive anywhere in a JSON response when the serial
+      // driver leaves XON/XOFF handling disabled. Keep them in raw diagnostics only.
+      data = data.replace(/[\x11\x13]/g, ''); // eslint-disable-line no-control-regex
+
       if (data.match(/^{/)) {
         try {
           data = JSON.parse(data);
