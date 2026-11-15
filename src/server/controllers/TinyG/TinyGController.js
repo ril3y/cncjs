@@ -6,6 +6,7 @@ import {
   ensureString,
 } from 'ensure-type';
 import fsp from 'fs/promises';
+import { randomBytes } from 'crypto';
 import * as gcodeParser from 'gcode-parser';
 import _ from 'lodash';
 import * as autolevel from '../../lib/autolevel';
@@ -64,6 +65,9 @@ const SENDER_STATUS_NONE = 'none';
 const log = logger('controller:TinyG');
 const noop = () => {};
 
+// A port reopen cannot erase this process's knowledge of an aborted epoch.
+const recoveryRequired = new Set();
+
 class TinyGController {
     type = TINYG;
 
@@ -114,6 +118,12 @@ class TinyGController {
     overrideBusy = false;
 
     programEpoch = 0;
+
+    recovery = null;
+
+    observationOnly = false;
+
+    setupGeneration = 0;
 
     ready = false;
 
@@ -244,6 +254,7 @@ class TinyGController {
       });
 
       this.transport = new TinyGTransport(data => this.connection.write(data), message => {
+        recoveryRequired.add(this.options.port);
         this.ready = false;
         this.sender.hold();
         this.emit('serialport:read', message);
@@ -751,31 +762,46 @@ class TinyGController {
       });
 
       this.runner.on('startup', () => {
-        this.ready = false;
-        this.workflow.stop();
-        this.feeder.reset();
-        this.transport.reset();
-        this.overridePending = {};
-        this.overrideBusy = false;
-        this.lineMode = false;
-        // A banner alone does not establish that old host writes have drained.
-        this.emit('serialport:read', 'TinyG restarted; reconnect before continuing');
+        if (this.recovery) {
+          this.recovery.banner = true;
+          this.probeRecovery();
+          return;
+        }
+        this.quarantine();
+        this.emit('serialport:read', 'TinyG restarted; explicit Reset recovery is required');
       });
 
       this.runner.on('response', data => {
+        if (this.recovery) {
+          const recovery = this.recovery;
+          if (!recovery.probed || data.tid !== recovery.tid) {
+            return;
+          }
+          if (data.f[1] !== 0 || !Number.isFinite(_.get(data, 'r.fb')) || Number(_.get(data, 'r.fb')) < 450.02 ||
+              ![1, 3, 4].includes(_.get(data, 'r.sr.stat'))) {
+            this.failRecovery('TinyG recovery probe did not confirm an idle board');
+            return;
+          }
+          clearTimeout(recovery.timer);
+          this.recovery = null;
+          recoveryRequired.delete(this.options.port);
+          this.transport.resume();
+          this.initController();
+          return;
+        }
         if (data.f[1] === 100 && data.r) {
           Object.keys(data.r).forEach(key => {
             if (key in this.sr) {
               this.sr[key] = false;
             }
-});
+          });
         }
         this.transport.receive(data);
       });
 
       this.runner.on('sr', (sr) => {
         // The board has left the ALARM state that rejected the connect-time setup
-        if (this.setup.rejected && !this.setup.running && this.runner.isIdle()) {
+        if (!recoveryRequired.has(this.options.port) && this.setup.rejected && !this.setup.running && this.runner.isIdle()) {
           log.debug('The alarm has been cleared: applying the controller setup again');
           this.setup.rejected = false;
           this.initController({ reapply: true });
@@ -864,15 +890,27 @@ class TinyGController {
 
     // https://github.com/synthetos/TinyG/wiki/TinyG-Configuration-for-Firmware-Version-0.97
     async initController(options) {
+      if (recoveryRequired.has(this.options.port)) {
+        this.transport.reset();
+        this.observationOnly = true;
+        this.ready = false;
+        this.emit('serialport:read', 'Explicit TinyG Reset recovery is required before setup');
+        return;
+      }
+      if (this.setup.running) {
+        return;
+      }
       const { reapply = false } = { ...options };
 
       // Every JSON command returns one response with a footer. Settings are written to EEPROM
       // with interrupts disabled, so the next command is sent only after the reply to the
       // previous one ("always run configuration commands synchronously" - Tinyg Communications
       // Programming). A missing reply times out so that a silent board cannot hang the setup.
+      const generation = ++this.setupGeneration;
       let rejected = false;
+      let lastResponse = null;
       const send = (cmd = '', optional = false) => new Promise((resolve, reject) => {
-        if (this.isClose() || this.transport.failed) {
+        if (generation !== this.setupGeneration || this.isClose() || this.transport.failed || this.transport.suspended) {
           reject(new Error('TinyG connection unavailable')); return;
         }
         const timer = setTimeout(() => {
@@ -884,6 +922,7 @@ class TinyGController {
           if (!response) {
             reject(new Error('TinyG setup cancelled')); return;
           }
+          lastResponse = response;
           const f = response.f;
           if ([204, 205].includes(Number(f[1]))) {
             rejected = true;
@@ -905,9 +944,20 @@ class TinyGController {
         return;
       }
       this.setup.running = true;
+      this.setup.rejected = false;
       this.ready = false;
+      this.observationOnly = true;
       try {
         await send('{fb:n}');
+        if (!Number.isFinite(_.get(lastResponse, 'r.fb')) || lastResponse.r.fb <= 0) {
+          throw new Error('TinyG did not return firmware identity; attachment remains observation-only');
+        }
+        await send('{sr:n}');
+        if (![1, 3, 4].includes(_.get(lastResponse, 'r.sr.stat'))) {
+          this.setup.rejected = true;
+          this.emit('serialport:read', 'TinyG must be idle before setup; attachment is observation-only');
+          return;
+        }
 
         // Enable JSON mode
         // 0=text mode, 1=JSON mode
@@ -1015,19 +1065,26 @@ class TinyGController {
         }
 
         this.ready = !this.setup.rejected;
+        this.observationOnly = !this.ready;
         if (reapply) {
           return;
         }
 
         await delay(50);
         this.ready = !this.setup.rejected;
+        this.observationOnly = !this.ready;
         this.event.trigger('controller:ready');
       } catch (err) {
+        if (generation !== this.setupGeneration) {
+          return;
+        }
         this.ready = false;
         this.setup.rejected = rejected;
         this.emit('serialport:read', err.message);
       } finally {
-        this.setup.running = false;
+        if (generation === this.setupGeneration) {
+          this.setup.running = false;
+        }
       }
     }
 
@@ -1182,6 +1239,10 @@ class TinyGController {
     }
 
     destroy() {
+      if (this.recovery) {
+        clearTimeout(this.recovery.timer);
+      }
+      this.recovery = null;
       if (this.transport) {
         this.transport.reset();
       }
@@ -1325,6 +1386,10 @@ class TinyGController {
 
         // Set ready flag to true
         this.ready = false;
+        if (recoveryRequired.has(port)) {
+          this.emit('serialport:read', 'Previous TinyG traffic was interrupted; explicit Reset recovery is required');
+          return;
+        }
         this.transport.resume();
 
         // Initialize controller
@@ -1333,6 +1398,13 @@ class TinyGController {
     }
 
     close(callback) {
+      if (this.recovery || this.transport.active.length || this.transport.pending.length || this.setup.running) {
+        recoveryRequired.add(this.options.port);
+      }
+      if (this.recovery) {
+        clearTimeout(this.recovery.timer);
+      }
+      this.recovery = null;
       const { port } = this.options;
 
       // Assertion check
@@ -1451,6 +1523,9 @@ class TinyGController {
     // ^d           Kill Job        Trigger ALARM to kill current job. Send {clear:n}, M2 or M30 to end ALARM state
     // ^x           Reset Board     Perform hardware reset to restart the board
     command(cmd, ...args) {
+      if (this.observationOnly && !['reset', 'statusreport', 'feedhold', 'cyclestart', 'unlock'].includes(cmd)) {
+        return;
+      }
       if (this.setup.running && !['reset', 'feedhold'].includes(cmd)) {
         return;
       }
@@ -2058,6 +2133,95 @@ class TinyGController {
       handler();
     }
 
+    quarantine() {
+      this.setupGeneration++;
+      this.setup.running = false;
+      this.observationOnly = true;
+      recoveryRequired.add(this.options.port);
+      this.ready = false;
+      this.workflow.stop();
+      this.feeder.reset();
+      this.transport.reset();
+      this.overridePending = {};
+      this.overrideBusy = false;
+      this.lineMode = false;
+    }
+
+    failRecovery(message) {
+      if (this.recovery) {
+        clearTimeout(this.recovery.timer);
+      }
+      this.recovery = null;
+      this.quarantine();
+      this.emit('serialport:read', message);
+    }
+
+    beginResetRecovery() {
+      if (this.recovery) {
+        clearTimeout(this.recovery.timer);
+      }
+      this.recovery = null;
+      this.quarantine();
+      const port = this.connection.port;
+      // Fresh correlated recovery is only supported on the verified tid contract.
+      // Legacy reset is still available, but must not silently unlock admission.
+      if (
+        !Number.isFinite(Number(this.runner.settings.fb)) ||
+        Number(this.runner.settings.fb) < 450.02 ||
+        !port ||
+        typeof port.drain !== 'function'
+      ) {
+        this.connection.write('\x18');
+        this.emit(
+          'serialport:read',
+          'Reset sent; this connection requires a qualified recovery procedure before streaming'
+        );
+        return;
+      }
+      const recovery = { tid: randomBytes(4).readUInt32BE(0), drained: false, banner: false, probed: false };
+      this.recovery = recovery;
+      recovery.timer = setTimeout(() => {
+        if (this.recovery === recovery) {
+          this.failRecovery('TinyG reset recovery timed out; admission remains blocked');
+        }
+      }, 5000);
+      // Drain orders the reset AFTER old host writes; it does not claim those
+      // commands executed. No normal writer may run while this epoch is suspended.
+      port.drain((err) => {
+        if (this.recovery !== recovery || this.isClose()) {
+          return;
+        }
+        if (err) {
+          this.failRecovery('Unable to drain TinyG output before reset');
+          return;
+        }
+        this.connection.write('\x18');
+        port.drain((error) => {
+          if (this.recovery !== recovery || this.isClose()) {
+            return;
+          }
+          if (error) {
+            this.failRecovery('Unable to establish TinyG reset output boundary');
+            return;
+          }
+          recovery.drained = true;
+          this.probeRecovery();
+        });
+      });
+    }
+
+    probeRecovery() {
+      const recovery = this.recovery;
+      if (!recovery || !recovery.drained || !recovery.banner || recovery.probed) {
+        return;
+      }
+      recovery.probed = true;
+      // One bounded read-only probe, after the ordered reset. Neither a stale
+      // banner nor an old untagged reply can complete it. Adapter ordering still
+      // needs hardware qualification; timeout never releases normal admission.
+      this.connection.write(JSON.stringify({ tid: recovery.tid, fb: null, sr: null }) + '\n');
+    }
+
     write(data, context) {
       // Assertion check
       if (this.isClose()) {
@@ -2066,6 +2230,9 @@ class TinyGController {
       }
 
       const realtime = ['!', '~', '%', '\x04', '\x18'].includes(String(data).trim());
+      if (this.observationOnly && !realtime && !/^\{\s*["']?[a-z]+["']?\s*:\s*(?:null|n|"")\s*\}\s*$/i.test(data)) {
+        return;
+      }
       if (this.setup.running && !realtime) {
         return;
       }
@@ -2074,18 +2241,13 @@ class TinyGController {
         source: WRITE_SOURCE_CLIENT
       });
       if (realtime) {
-        if (['\x18', '\x04', '%'].includes(data.trim())) {
-          this.workflow.stop();
-          this.feeder.reset();
-          this.overridePending = {};
-          this.overrideBusy = false;
-          this.transport.reset();
-          this.lineMode = false;
-          this.ready = false;
-          if (data.trim() !== '%') {
- this.runner.settings = { ...this.runner.settings, mfo: 1, sso: 1 };
-}
-          this.emit('serialport:read', 'TinyG input was discarded; reconnect before continuing');
+        if (data.trim() === '\x18') {
+          this.beginResetRecovery();
+          return;
+        }
+        if (['\x04', '%'].includes(data.trim())) {
+          this.quarantine();
+          this.emit('serialport:read', 'TinyG input discarded; explicit Reset recovery is required');
         }
         this.connection.write(data.trim());
         return;
