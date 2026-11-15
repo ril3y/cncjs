@@ -101,7 +101,9 @@ class TinyGController {
         });
       },
       error: (err) => {
-        this.ready = false;
+        // A driver error can arrive after write() returned, with unknown partial
+        // delivery. Cancel this epoch before any late reply can refill the queue.
+        this.failRecovery('TinyG serial I/O failed; explicit Reset recovery is required before streaming');
         if (err) {
           log.error(`Unexpected error while reading/writing serial port "${this.options.port}":`, err);
         }

@@ -2,6 +2,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { EventEmitter } from 'events';
 
 import TinyGController from '../TinyGController';
 import config from '../../../services/configstore';
@@ -17,6 +18,7 @@ import {
   WRITE_SOURCE_FEEDER,
 } from '../../constants';
 import { SP_TYPE_LINE_COUNTING, SP_TYPE_SEND_RESPONSE } from '../../../lib/Sender';
+import SerialConnection from '../../../lib/SerialConnection';
 import { createController } from '../../__tests__/helpers/createController';
 
 let controllers = [];
@@ -1155,6 +1157,38 @@ describe('TinyGController', () => {
   });
 
   describe('recovery and state-preserving attachment', () => {
+    test('asynchronous driver error quarantines queued writes through SerialConnection', async () => {
+      const { controller, writes } = setupController();
+      const connection = new SerialConnection({ path: controller.options.port });
+      const driver = new EventEmitter();
+      driver.isOpen = true;
+      driver.write = data => writes.push({ data });
+      driver.on('error', connection.eventListener.error);
+      connection.port = driver;
+      connection.on('error', controller.connectionEventListener.error);
+      connection.on('data', controller.connectionEventListener.data);
+      controller.connection = connection;
+      controller.transport.lineMode = true;
+      controller.transport.slots = 12;
+      controller.transport.enqueue('N1' + 'X'.repeat(150), { n: 1 });
+      controller.transport.enqueue('N2G1X2', { n: 2 });
+      expect(controller.transport.pending).toHaveLength(1);
+      await new Promise(resolve => setImmediate(() => {
+        driver.emit('error', new Error('asynchronous USB write failure'));
+        resolve();
+      }));
+      expect(controller.ready).toBe(false);
+      expect(controller.observationOnly).toBe(true);
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.transport.pending).toHaveLength(0);
+      connection.eventListener.data('{"r":{"n":1},"f":[3,0,12]}');
+      controller.transport.pump();
+      controller.write('G1X3\n');
+      expect(writes).toHaveLength(1);
+      await controller.initController();
+      expect(writes).toHaveLength(1); // setup/reopen cannot erase the failed epoch
+    });
+
     test('startup during the final setup delay cannot restore readiness', async () => {
       const { controller, writes } = setupController();
       const trigger = jest.spyOn(controller.event, 'trigger');
