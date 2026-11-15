@@ -351,7 +351,7 @@ describe('TinyGController', () => {
     test('legacy M0 requires a fresh fully freed planner and STOP after its ACK', () => {
       const { controller, writes } = setupController();
       controller.runner.settings.fb = 449.02;
-      controller.runner.plannerBufferPoolSize = 28;
+      controller.runner.plannerBufferPoolSize = 28; // a partial observation must not become capacity
       controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
       controller.command('gcode:start');
       controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
@@ -360,7 +360,59 @@ describe('TinyGController', () => {
       expect(data(writes)).not.toContain('~');
       controller.command('gcode:resume');
       controller.runner.parse('{"r":{"qr":28,"stat":3},"f":[2,0,250]}');
+      expect(data(writes)).not.toContain('~');
+      controller.command('gcode:resume');
+      controller.runner.parse('{"r":{"qr":32,"stat":3},"f":[2,0,250]}');
       expect(data(writes)).toContain('~');
+    });
+
+    test.each([440.21, 449.02])('legacy %s host M6 pause uses a real queued M0', fb => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = fb;
+      controller.command('gcode:load', 'tool.nc', 'G1X100\nM6\nG1X0');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
+      expect(data(writes)[1]).toBe('N2M0\n');
+      controller.runner.parse('{"r":{"n":2},"f":[2,0,250]}');
+      controller.command('gcode:resume');
+      controller.runner.parse('{"r":{"qr":31,"stat":3},"f":[2,0,250]}');
+      expect(data(writes)).not.toContain('~');
+      controller.command('gcode:resume');
+      controller.runner.parse('{"r":{"qr":32,"stat":3},"f":[2,0,250]}');
+      expect(data(writes)).toContain('~');
+      expect(data(writes)).toContain('N3G1X0\n');
+    });
+
+    test('unknown legacy build cannot infer a stop fence from an observed qr maximum', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 449.03;
+      controller.runner.plannerBufferPoolSize = 28;
+      controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
+      controller.command('gcode:resume');
+      expect(data(writes)).toEqual(['N1M0\n']);
+    });
+
+    test('a missing execution-fence reply times out without releasing queued motion', () => {
+      jest.useFakeTimers();
+      try {
+        const { controller, writes } = setupController();
+        controller.runner.settings.fb = 450.06;
+        controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
+        controller.command('gcode:start');
+        controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+        controller.command('gcode:resume');
+        jest.advanceTimersByTime(10 * 60 * 1000);
+        expect(controller.transport.suspended).toBe(true);
+        expect(controller.ready).toBe(false);
+        expect(data(writes)).not.toContain('~');
+        expect(data(writes)).not.toContain('N2G1X1\n');
+        controller.runner.parse('{"r":{"gc":"M400"},"f":[3,0,12]}');
+        expect(data(writes)).not.toContain('~');
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     test('actual startup during a job cancels owners and requires reconnect without sending motion', () => {

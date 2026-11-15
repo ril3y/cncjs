@@ -21,6 +21,7 @@ export default class TinyGTransport {
     this.failed = false;
     this.paused = false;
     this.pauseThrough = 0;
+    this.fencing = false;
     requests.forEach((request) => request.done && request.done(null));
   }
 
@@ -61,7 +62,7 @@ export default class TinyGTransport {
       kind = 'program';
     }
     const request = { ...options, line, bytes, kind, key };
-    if (options.priority) {
+    if (options.priority && (!this.fencing || options.fence)) {
       this.pending.unshift(request);
     } else {
       this.pending.push(request);
@@ -89,9 +90,13 @@ export default class TinyGTransport {
           this.pending.unshift(...this.pending.splice(controlIndex, 1));
         }
         const request = this.pending[0];
+        if (this.fencing && !request.fence) {
+          break;
+        }
         const control = !request.n;
         if (this.active.length) {
           if (
+            request.fence ||
             !this.lineMode ||
             this.bytes + request.bytes > (control ? 200 : 136)
           ) {

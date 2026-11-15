@@ -68,6 +68,10 @@ const noop = () => {};
 // A port reopen cannot erase this process's knowledge of an aborted epoch.
 const recoveryRequired = new Set();
 
+// Verified released legacy snapshots: firmware/tinyg/planner.h defines 32.
+// An observed qr maximum during attachment is not proof of an empty planner.
+const legacyPlannerCapacity = (build) => ([440.21, 449.02].includes(build) ? 32 : 0);
+
 class TinyGController {
     type = TINYG;
 
@@ -489,6 +493,12 @@ class TinyGController {
           if (words.find(isM6)) {
             log.debug(`M6 Tool Change: line=${x(originalLine)}, sent=${sent}, received=${received}`);
 
+            // The host already pauses at an ignored/manual M6. On the verified
+            // legacy builds, give that pause a real queued stop to fence; these
+            // builds do not have the modern deferred M400 completion contract.
+            const needsStop = legacyPlannerCapacity(Number(this.runner.settings.fb)) && !words.find(isM0) && !words.find(isM1);
+            const replacement = needsStop ? 'M0' : '(M6)';
+
             const toolChangePolicy = config.get('tool.toolChangePolicy', TOOL_CHANGE_POLICY_IGNORE_M6_COMMANDS);
             const isManualToolChange = [
               TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS,
@@ -498,7 +508,7 @@ class TinyGController {
 
             if (toolChangePolicy === TOOL_CHANGE_POLICY_IGNORE_M6_COMMANDS) {
               // Ignore M6 commands
-              line = replaceM6(line, (x) => `(${x})`); // replace with parentheses
+              line = replaceM6(line, () => replacement);
 
               this.event.trigger('gcode:pause');
               this.workflow.pause({
@@ -509,7 +519,7 @@ class TinyGController {
               // Send M6 commands
             } else if (isManualToolChange) {
               // Manual Tool Change
-              line = replaceM6(line, (x) => `(${x})`); // replace with parentheses
+              line = replaceM6(line, () => replacement);
 
               this.event.trigger('gcode:pause');
               this.workflow.pause({
@@ -1677,14 +1687,25 @@ class TinyGController {
           }
           const epoch = this.programEpoch;
           const modern = Number(this.runner.settings.fb) >= 450.01;
-          const plannerCapacity = this.runner.plannerBufferPoolSize;
+          const plannerCapacity = legacyPlannerCapacity(Number(this.runner.settings.fb));
+          if (!modern && !plannerCapacity) {
+            this.emit('serialport:read', 'This firmware has no verified program-pause fence; update TinyG before resuming this job');
+            return;
+          }
           this.stopProbePending = true;
+          this.transport.fencing = true;
+          const timer = setTimeout(() => {
+            this.failRecovery('TinyG program-pause fence timed out; explicit Reset recovery is required');
+          }, 10 * 60 * 1000);
           // M400 on 450.01+ replies only after planner, runtime and prepared
           // segments drain. A marker ACK alone only proves that it was parsed.
           this.transport.enqueue(modern ? 'M400' : '{qr:null,stat:null}', {
             priority: true,
+            fence: true,
             done: response => {
+              clearTimeout(timer);
               this.stopProbePending = false;
+              this.transport.fencing = false;
               if (!response || response.f[1] || epoch !== this.programEpoch ||
                   !this.workflow.isPaused() || this.transport.pauseThrough !== barrier) {
                 return;

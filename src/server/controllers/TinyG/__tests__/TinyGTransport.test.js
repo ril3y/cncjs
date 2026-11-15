@@ -215,3 +215,17 @@ test('write failure preserves uncertain byte debt and prevents further writes', 
   transport.enqueue('N2G1X2', { n: 2 });
   expect(write).toHaveBeenCalledTimes(1);
 });
+
+test('execution fence waits for every prior owner and blocks all later ordinary writes', () => {
+  const { transport, write } = setup();
+  transport.enqueue('N1M0', { n: 1 });
+  transport.fencing = true;
+  transport.enqueue('M400', { priority: true, fence: true, done: () => { transport.fencing = false; } });
+  transport.enqueue('G1X2');
+  transport.enqueue('{mfo:1.1}', { priority: true });
+  expect(write).toHaveBeenCalledTimes(1);
+  transport.receive({ r: { n: 1 }, f: [3, 0, 12] });
+  expect(write.mock.calls.flat()).toEqual(['N1M0\n', 'M400\n']);
+  transport.receive({ r: { gc: 'M400' }, f: [3, 0, 12] });
+  expect(write.mock.calls.flat()).toContain('G1X2\n');
+});
