@@ -221,11 +221,13 @@ describe('TinyGController', () => {
       controller.runner.settings.fb = 450.06;
       controller.command(command, 10);
       controller.command(command, 10);
-      expect(data(writes)).toEqual([JSON.stringify({ [key]: 1.1 }) + '\n']);
-      controller.runner.parse(JSON.stringify({ r: { [key]: 1.1 }, f: [3, 0, 10] }));
-      expect(writes).toHaveLength(2); // authoritative GET
-      controller.runner.parse(JSON.stringify({ r: { [key]: 1.1 }, f: [3, 0, 10] }));
-      expect(data(writes)[2]).toBe(JSON.stringify({ [key]: 1.2 }) + '\n');
+      expect(writes).toHaveLength(1); // fresh GET before computing the delta
+      controller.runner.parse(JSON.stringify({ r: { [key]: 1 }, f: [3, 0, 10] }));
+      expect(data(writes)[1]).toBe(JSON.stringify({ [key]: 1.2 }) + '\n');
+      controller.runner.parse(JSON.stringify({ r: { [key]: 1.2 }, f: [3, 0, 10] }));
+      expect(writes).toHaveLength(3); // authoritative readback
+      controller.runner.parse(JSON.stringify({ r: { [key]: 1.2 }, f: [3, 0, 10] }));
+      expect(controller.overrideBusy).toBe(false);
     });
 
     test.each([0, 440.21, 449.02, 450.04, 450.05, 450.06])('override capability gates for %s', fb => {
@@ -245,13 +247,14 @@ describe('TinyGController', () => {
       const { controller, writes } = setupController();
       controller.runner.settings.fb = 450.06;
       controller.command('feedOverride', 10);
+      controller.runner.parse('{"r":{"mfo":1},"f":[3,0,10]}');
       controller.runner.parse(JSON.stringify({ r: { mfo: 1.1 }, f: [3, code, 10] }));
       expect(controller.runner.settings.mfo).toBe(1);
-      expect(data(writes)[1]).toBe('{"mfo":null,"mfc":null,"mfe":null}\n');
+      expect(data(writes)[2]).toBe('{"mfo":null,"mfc":null,"mfe":null}\n');
       controller.runner.parse('{"r":{"mfo":0.8,"mfc":1,"mfe":0},"f":[3,0,10]}');
       expect(controller.runner.settings.mfo).toBe(0.8);
       expect(controller.runner.settings.mfe).toBe(0);
-      expect(writes).toHaveLength(2);
+      expect(writes).toHaveLength(3);
       expect(controller.overrideBusy).toBe(false);
     });
 
@@ -262,7 +265,27 @@ describe('TinyGController', () => {
       controller.runner.parse('{"ov":{"v":1,"q":5,"mfo":1,"mfc":1,"mfe":1}}');
       expect(controller.sender.state.received).toBe(0);
       controller.command('feedOverride', 10);
-      expect(data(writes)).toEqual(['{"mfo":1.1}\n']);
+      controller.runner.parse('{"r":{"mfo":1},"f":[3,0,10]}');
+      expect(data(writes)[1]).toBe('{"mfo":1.1}\n');
+    });
+
+    test.each([['feedOverride', 'mfo'], ['spindleOverride', 'sso']])('%s reads a job-end reset before applying a click', (command, key) => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.runner.settings[key] = 1.8;
+      controller.command(command, 10);
+      // No status/event has delivered the firmware's reset yet.
+      controller.runner.parse(JSON.stringify({ r: { [key]: 1 }, f: [3, 0, 12] }));
+      expect(data(writes)[1]).toBe(JSON.stringify({ [key]: 1.1 }) + '\n');
+    });
+
+    test('coalesced clicks preserve saturation and reset order', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('feedOverride', 100);
+      controller.command('feedOverride', -100);
+      controller.runner.parse('{"r":{"mfo":1.8},"f":[3,0,12]}');
+      expect(data(writes)[1]).toBe('{"mfo":1}\n');
     });
 
     test('reset discards pending override intent and credits', () => {
@@ -289,6 +312,7 @@ describe('TinyGController', () => {
 
     test.each(['M0', 'M1'])('ordered %s reaches the board before Resume and blocks later data', marker => {
       const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
       controller.command('gcode:load', 'stop.nc', marker + '\nG1X1');
       controller.command('gcode:start');
       expect(data(writes)).toEqual(['N1' + marker + '\n']);
@@ -297,8 +321,44 @@ describe('TinyGController', () => {
       expect(writes).toHaveLength(1); // never send ~ ahead of the marker
       controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
       controller.command('gcode:resume');
-      expect(data(writes)[1]).toBe('~');
-      expect(data(writes)[2]).toBe('N2G1X1\n');
+      expect(data(writes)[1]).toBe('M400\n');
+      controller.runner.parse('{"r":{"gc":"M400"},"f":[3,0,12]}');
+      expect(data(writes)[2]).toBe('~');
+      expect(data(writes)[3]).toBe('N2G1X1\n');
+    });
+
+    test.each(['M0', 'M1', 'M6'])('%s behind a long move waits for execution, not its ACK', marker => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'long-stop.nc', 'G1X100\n' + marker + '\nG1X0');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      controller.runner.parse('{"r":{"n":2},"f":[3,0,12]}');
+      controller.runner.parse('{"sr":{"stat":5}}');
+      controller.command('gcode:resume');
+      expect(data(writes)).not.toContain('~');
+      expect(data(writes)).not.toContain('N3G1X0\n');
+      expect(data(writes).pop()).toBe('M400\n');
+      // M1 disabled / host-ignored M6 need not report STOP, but the deferred
+      // fence still waits for the final prepared/running segment to complete.
+      controller.runner.parse('{"r":{"gc":"M400"},"f":[3,0,12]}');
+      expect(data(writes)).toContain('~');
+      expect(data(writes)).toContain('N3G1X0\n');
+    });
+
+    test('legacy M0 requires a fresh fully freed planner and STOP after its ACK', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 449.02;
+      controller.runner.plannerBufferPoolSize = 28;
+      controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
+      controller.command('gcode:resume');
+      controller.runner.parse('{"r":{"qr":27,"stat":3},"f":[2,0,250]}');
+      expect(data(writes)).not.toContain('~');
+      controller.command('gcode:resume');
+      controller.runner.parse('{"r":{"qr":28,"stat":3},"f":[2,0,250]}');
+      expect(data(writes)).toContain('~');
     });
 
     test('actual startup during a job cancels owners and requires reconnect without sending motion', () => {

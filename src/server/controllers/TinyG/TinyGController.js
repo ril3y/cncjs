@@ -1112,11 +1112,15 @@ class TinyGController {
       if (!this.ready || !Number.isFinite(fb) || !Number.isFinite(step) || fb < (key === 'mfo' ? 450.05 : 450.06)) {
         return;
       }
-      const current = this.overridePending[key] ?? this.runner.settings[key];
-      if (!Number.isFinite(current)) {
-        return;
-      }
-      this.overridePending[key] = step === 0 ? 1 : Math.max(0.05, Math.min(2, Math.round(current * 100 + step) / 100));
+      // Compose relative clicks without trusting a cache that may predate M2/M30.
+      // This bounded transform preserves per-click saturation and reset ordering.
+      const clamp = value => Math.max(0.05, Math.min(2, value));
+      const pending = this.overridePending[key] || { delta: 0, min: 0.05, max: 2 };
+      this.overridePending[key] = step === 0 ? { delta: 0, min: 1, max: 1 } : {
+        delta: pending.delta + step / 100,
+        min: clamp(pending.min + step / 100),
+        max: clamp(pending.max + step / 100)
+      };
       this.sendOverride();
     }
 
@@ -1128,36 +1132,50 @@ class TinyGController {
       if (!key) {
         return;
       }
-      const value = this.overridePending[key];
       this.overrideBusy = true;
-      this.transport.enqueue(JSON.stringify({ [key]: value }), {
+      const fields = key === 'mfo' ? { mfo: null, mfc: null, mfe: null } : { sso: null, ssc: null, sse: null };
+      const cancel = () => {
+        this.overridePending = {};
+        this.overrideBusy = false;
+      };
+      // Priority GET then SET closes the job-end/cache race, including spindle
+      // resets that have no ov event. Coalesce clicks arriving during the GET.
+      this.transport.enqueue(JSON.stringify(fields), {
         priority: true,
-        done: (response) => {
-          if (!response) {
-            this.overridePending = {};
-            this.overrideBusy = false;
+        done: result => {
+          const base = _.get(result, ['r', key]);
+          if (!result || result.f[1] || !Number.isFinite(base)) {
+            cancel();
             return;
           }
-          const failed = response.f[1] !== 0;
-          if (failed || this.overridePending[key] === value) {
-            delete this.overridePending[key];
-          }
-          if (failed) {
-            this.emit('serialport:read', `TinyG override rejected (${response.f[1]})`);
-          }
-          // A SET acknowledges acceptance, not application. Read authoritative state,
-          // including after 104/110; failure is reported without an endless retry.
-          const fields = key === 'mfo' ? { mfo: null, mfc: null, mfe: null } : { sso: null, ssc: null, sse: null };
-          this.transport.enqueue(JSON.stringify(fields), {
+          const pending = this.overridePending[key];
+          delete this.overridePending[key];
+          const value = Math.round(Math.max(pending.min, Math.min(pending.max, base + pending.delta)) * 100) / 100;
+          this.transport.enqueue(JSON.stringify({ [key]: value }), {
             priority: true,
-            done: (result) => {
-              this.overrideBusy = false;
-              if (!result || result.f[1]) {
-                this.overridePending = {};
-                this.emit('serialport:read', 'TinyG override readback failed');
+            done: response => {
+              if (!response) {
+                cancel();
                 return;
               }
-              this.sendOverride();
+              if (response.f[1]) {
+                this.overridePending = {};
+                this.emit('serialport:read', `TinyG override rejected (${response.f[1]})`);
+              }
+              // Acceptance does not imply application. Always read back, including
+              // status104/110; never publish a rejected requested factor.
+              this.transport.enqueue(JSON.stringify(fields), {
+                priority: true,
+                done: readback => {
+                  this.overrideBusy = false;
+                  if (!readback || readback.f[1]) {
+                    cancel();
+                    this.emit('serialport:read', 'TinyG override readback failed');
+                    return;
+                  }
+                  this.sendOverride();
+                }
+              });
             }
           });
         }
@@ -1641,12 +1659,42 @@ class TinyGController {
             this.emit('serialport:read', 'Waiting for the program stop marker before resuming');
             return;
           }
-          this.transport.pauseThrough = 0;
-          this.event.trigger('gcode:resume');
-
-          this.writeln('~'); // cycle start
-          this.workflow.resume();
-          this.writeln('{"qr":""}'); // queue report
+          const resume = () => {
+            this.transport.pauseThrough = 0;
+            this.event.trigger('gcode:resume');
+            this.writeln('~'); // cycle start
+            this.workflow.resume();
+            this.writeln('{"qr":""}'); // queue report
+          };
+          if (!barrier) {
+            resume();
+            return;
+          }
+          if (this.stopProbePending) {
+            return;
+          }
+          const epoch = this.programEpoch;
+          const modern = Number(this.runner.settings.fb) >= 450.01;
+          const plannerCapacity = this.runner.plannerBufferPoolSize;
+          this.stopProbePending = true;
+          // M400 on 450.01+ replies only after planner, runtime and prepared
+          // segments drain. A marker ACK alone only proves that it was parsed.
+          this.transport.enqueue(modern ? 'M400' : '{qr:null,stat:null}', {
+            priority: true,
+            done: response => {
+              this.stopProbePending = false;
+              if (!response || response.f[1] || epoch !== this.programEpoch ||
+                  !this.workflow.isPaused() || this.transport.pauseThrough !== barrier) {
+                return;
+              }
+              if (!modern && (plannerCapacity <= 0 ||
+                  _.get(response, 'r.qr') !== plannerCapacity || _.get(response, 'r.stat') !== 3)) {
+                this.emit('serialport:read', 'Waiting for the program stop to execute before resuming');
+                return;
+              }
+              resume();
+            }
+          });
         },
         'feeder:feed': () => {
           const [commands, context = {}] = args;
