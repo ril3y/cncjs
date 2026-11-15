@@ -54,16 +54,9 @@ class TinyG extends PureComponent {
       const none = '–';
       const controllerState = state.controller.state;
       const controllerSettings = state.controller.settings;
-      const { fv, mfo, mto, sso } = controllerSettings;
-      // https://github.com/cncjs/cncjs/issues/160
-      // Firmware | mfo | sso | mto
-      // -------- | --- | --- | ----
-      // 0.97     | No  | No  | No
-      // 0.98     | No  | Yes | No
-      // 0.99     | Yes | Yes | Yes
-      const ovF = (fv >= 0.99) ? Math.round(mfo * 100) || 0 : 0;
-      const ovS = (fv >= 0.98) ? Math.round(sso * 100) || 0 : 0;
-      const ovT = (fv >= 0.99) ? Math.round(mto * 100) || 0 : 0;
+      const { fb, mfc, ssc, mfe, sse } = controllerSettings;
+      const ovF = fb >= 450.05 ? Math.round((mfc ?? 1) * 100) : 0;
+      const ovS = fb >= 450.06 ? Math.round((ssc ?? 1) * 100) : 0;
       const pwr = get(controllerState, 'pwr');
       const machineState = get(controllerState, 'sr.machineState');
       const machineStateText = {
@@ -93,7 +86,11 @@ class TinyG extends PureComponent {
 
       return (
         <div>
-          <Overrides ovF={ovF} ovS={ovS} ovT={ovT} />
+          <Overrides ovF={ovF} ovS={ovS} />
+          {mfe === 0 && <div>Feed override disabled by program or operator</div>}
+          {sse === 0 && <div>Spindle override disabled by program or operator</div>}
+          {fb >= 450.05 && fb < 450.06 && <div>Firmware 450.05 has limited feed override support.</div>}
+          {fb > 0 && fb < 450.06 && <a href="https://run.synthetos.com/update" target="_blank" rel="noopener noreferrer">Update TinyG for full feed and spindle overrides</a>}
           <Panel className={styles.panel}>
             <Panel.Heading className={styles.panelHeading}>
               <Toggler

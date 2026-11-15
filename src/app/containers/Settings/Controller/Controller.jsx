@@ -102,7 +102,7 @@ class Controller extends PureComponent {
                       checked={state.tinygLineMode}
                       onChange={this.handlers.handleChangeTinyGLineMode}
                     />
-                    {i18n._('Stream G-code in line mode with firmware build 446 or later')}
+                    {i18n._('Stream G-code in line mode with firmware build 450.02 or later')}
                   </label>
                   <p style={{ marginLeft: 20 }}>
                     <span>{i18n._('Keeps several lines in the receive buffer of the controller. Takes effect on the next connection.')}</span>

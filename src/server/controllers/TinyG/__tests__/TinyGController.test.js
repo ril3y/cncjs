@@ -52,6 +52,7 @@ const setupController = (configOverrides = {}) => {
   // observed through the socket-facing 'serialport:write' event instead.
   const events = [];
   controller.sockets.test = { emit: (event, ...args) => events.push({ event, args }) };
+  controller.ready = true; // Unit tests bypass the connection setup.
   controllers.push(controller);
 
   return { controller, writes, events };
@@ -66,11 +67,17 @@ const sourceOf = (events, text) => events
 // The feeder writes one line per machine acknowledgement and parks on M0/%wait
 // holds; unholding between next() calls replays the full queue synchronously.
 const drainFeeder = (controller) => {
-  while (controller.feeder.size() > 0) {
+  let limit = 1000;
+  while (limit-- > 0 && (controller.feeder.size() || controller.transport.active.length || controller.transport.pending.length)) {
     if (controller.feeder.state.hold) {
       controller.feeder.unhold();
     }
-    controller.feeder.next();
+    if (controller.transport.active.length) {
+      const request = controller.transport.active[0];
+      controller.runner.parse(JSON.stringify({ r: request.n ? { n: request.n } : {}, f: [2, 0, 250] }));
+    } else {
+      controller.feeder.next();
+    }
   }
 };
 
@@ -135,7 +142,7 @@ const respondToWrites = (controller, writes, reply) => {
 };
 
 const setupCommands = [
-  '{ej:1}', '{jv:4}', '{qv:1}', '{sv:1}', '{si:200}',
+  '{fb:n}', '{ej:1}', '{jv:5}', '{ex:0}', '{qv:1}', '{sv:1}', '{si:200}',
   '{spe:n}', '{spd:n}', '{spc:n}', '{sps:n}', '{com:n}', '{cof:n}',
   expect.stringMatching(/^{sr:{stat:t,/),
   '{sys:n}', '{mt:n}', '{pwr:n}', '{qr:n}', '{sr:n}',
@@ -167,18 +174,19 @@ const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) =
 describe('TinyGController', () => {
   describe('command handlers', () => {
     test.each([
-      ['feedhold', ['!\n', '{"qr":""}\n']],
-      ['cyclestart', ['~\n', '{"qr":""}\n']],
+      ['feedhold', ['!', '{"qr":""}\n']],
+      ['cyclestart', ['~', '{"qr":""}\n']],
       ['statusreport', ['{"sr":null}\n']],
       ['homing', ['G28.2 X0 Y0 Z0\n']],
       ['sleep', []],
       ['unlock', ['{clear:null}\n']],
-      ['jogCancel', ['!\n', '%\n']],
+      ['jogCancel', ['!', '%']],
     ])('command %s writes %j', (cmd, expected) => {
       const { controller, writes } = setupController();
 
       controller.command(cmd);
 
+      drainFeeder(controller);
       expect(data(writes)).toEqual(expected);
     });
 
@@ -191,6 +199,7 @@ describe('TinyGController', () => {
       expect(sourceOf(events, '!\n')).toEqual([WRITE_SOURCE_CLIENT]);
       expect(sourceOf(events, '{"qr":""}\n')).toEqual([WRITE_SOURCE_CLIENT, WRITE_SOURCE_CLIENT]);
       expect(sourceOf(events, '~\n')).toEqual([WRITE_SOURCE_CLIENT]);
+      drainFeeder(controller);
       expect(writes).toHaveLength(4);
     });
 
@@ -206,60 +215,75 @@ describe('TinyGController', () => {
       expect(controller.workflow.state).toBe(WORKFLOW_STATE_IDLE);
     });
 
-    describe('feedOverride', () => {
-      test.each([
-        [0, '{mfo:1}'],
-        [150, '{mfo:2}'],
-        [-96, '{mfo:0.05}'],
-        [10, '{mfo:1.1}'],
-      ])('feedOverride %i writes %s via the feeder', (value, expected) => {
-        const { controller, writes, events } = setupController();
-        controller.runner.settings.mfo = 1;
-
-        controller.command('feedOverride', value);
-
-        expect(data(writes)).toEqual([expected + '\n']);
-        expect(sourceOf(events, expected + '\n')).toEqual([WRITE_SOURCE_FEEDER]);
-      });
+    test.each([['feedOverride', 'mfo'], ['spindleOverride', 'sso']])('%s coalesces clicks and reads back before the next write', (command, key) => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command(command, 10);
+      controller.command(command, 10);
+      expect(data(writes)).toEqual([JSON.stringify({ [key]: 1.1 }) + '\n']);
+      controller.runner.parse(JSON.stringify({ r: { [key]: 1.1 }, f: [3, 0, 10] }));
+      expect(writes).toHaveLength(2); // authoritative GET
+      controller.runner.parse(JSON.stringify({ r: { [key]: 1.1 }, f: [3, 0, 10] }));
+      expect(data(writes)[2]).toBe(JSON.stringify({ [key]: 1.2 }) + '\n');
     });
 
-    describe('spindleOverride', () => {
-      test.each([
-        [0, '{sso:1}'],
-        [150, '{sso:2}'],
-        [-96, '{sso:0.05}'],
-        [10, '{sso:1.1}'],
-      ])('spindleOverride %i writes %s via the feeder', (value, expected) => {
-        const { controller, writes } = setupController();
-        controller.runner.settings.sso = 1;
-
-        controller.command('spindleOverride', value);
-
-        expect(data(writes)).toEqual([expected + '\n']);
-      });
+    test.each([0, 440.21, 449.02, 450.04, 450.05, 450.06])('override capability gates for %s', fb => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = fb;
+      controller.command('rapidOverride', 50);
+      expect(writes).toHaveLength(0);
+      controller.command('spindleOverride', 10);
+      expect(writes).toHaveLength(fb >= 450.06 ? 1 : 0);
+      if (fb < 450.06) {
+        controller.command('feedOverride', 10);
+        expect(writes).toHaveLength(fb >= 450.05 ? 1 : 0);
+      }
     });
 
-    describe('rapidOverride', () => {
-      test.each([
-        [0, '{mto:1}'],
-        [100, '{mto:1}'],
-        [50, '{mto:0.5}'],
-        [25, '{mto:0.25}'],
-      ])('rapidOverride %i writes %s via the feeder', (value, expected) => {
-        const { controller, writes } = setupController();
+    test.each([104, 110])('override error %s reads back the board value without retrying the write', code => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('feedOverride', 10);
+      controller.runner.parse(JSON.stringify({ r: { mfo: 1.1 }, f: [3, code, 10] }));
+      expect(controller.runner.settings.mfo).toBe(1);
+      expect(data(writes)[1]).toBe('{"mfo":null,"mfc":null,"mfe":null}\n');
+      controller.runner.parse('{"r":{"mfo":0.8,"mfc":1,"mfe":0},"f":[3,0,10]}');
+      expect(controller.runner.settings.mfo).toBe(0.8);
+      expect(controller.runner.settings.mfe).toBe(0);
+      expect(writes).toHaveLength(2);
+      expect(controller.overrideBusy).toBe(false);
+    });
 
-        controller.command('rapidOverride', value);
+    test('feed change event updates the next increment but never acknowledges a program', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.runner.settings.mfo = 1.8;
+      controller.runner.parse('{"ov":{"v":1,"q":5,"mfo":1,"mfc":1,"mfe":1}}');
+      expect(controller.sender.state.received).toBe(0);
+      controller.command('feedOverride', 10);
+      expect(data(writes)).toEqual(['{"mfo":1.1}\n']);
+    });
 
-        expect(data(writes)).toEqual([expected + '\n']);
-      });
+    test('reset discards pending override intent and credits', () => {
+      const { controller } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('feedOverride', 10);
+      controller.command('feedOverride', 10);
+      controller.command('reset');
+      expect(controller.overridePending).toEqual({});
+      expect(controller.overrideBusy).toBe(false);
+      expect(controller.runner.settings.mfo).toBe(1);
+      expect(controller.transport.active).toHaveLength(0);
+      expect(controller.transport.slots).toBe(0);
+      expect(controller.ready).toBe(false);
+    });
 
-      test('rapidOverride ignores unsupported values', () => {
-        const { controller, writes } = setupController();
-
-        controller.command('rapidOverride', 75);
-
-        expect(writes).toEqual([]);
-      });
+    test('rejects an overlong program after numbering without transmitting it', () => {
+      const { controller, writes } = setupController();
+      controller.command('gcode:load', 'long.nc', 'G1X' + '1'.repeat(250));
+      controller.command('gcode:start');
+      expect(writes).toHaveLength(0);
+      expect(controller.transport.failed).toBe(true);
     });
 
     describe('energizeMotors', () => {
@@ -279,6 +303,7 @@ describe('TinyGController', () => {
         controller.command('energizeMotors:on');
         controller.command('energizeMotors:on');
 
+        drainFeeder(controller);
         expect(data(writes)).toEqual(['{me:0}\n', '{pwr:n}\n']);
         expect(controller.timer.energizeMotors).not.toBeNull();
       });
@@ -290,6 +315,7 @@ describe('TinyGController', () => {
         controller.command('energizeMotors:on');
         controller.command('energizeMotors:off');
 
+        drainFeeder(controller);
         expect(data(writes)).toEqual(['{me:0}\n', '{pwr:n}\n', '{md:0}\n', '{pwr:n}\n']);
         expect(controller.timer.energizeMotors).toBeNull();
       });
@@ -351,7 +377,9 @@ describe('TinyGController', () => {
       controller.command('feeder:feed', ['G0 X0', 'G0 X1']);
       controller.command('feeder:start');
 
-      expect(data(writes)).toEqual(['G0 X0\n', '~\n', '{"qr":""}\n', 'G0 X1\n']);
+      expect(data(writes)).toEqual(['G0 X0\n', '~']);
+      drainFeeder(controller);
+      expect(data(writes)).toEqual(['G0 X0\n', '~', '{"qr":""}\n', 'G0 X1\n']);
       expect(sourceOf(events, '~\n')).toEqual([WRITE_SOURCE_CLIENT]);
       expect(sourceOf(events, 'G0 X1\n')).toEqual([WRITE_SOURCE_FEEDER]);
     });
@@ -442,7 +470,9 @@ describe('TinyGController', () => {
       controller.command('gcode:start');
       controller.command('gcode:pause');
 
-      expect(data(writes)).toEqual(['N1G21\n', '!\n', '{"qr":""}\n']);
+      expect(data(writes)).toEqual(['N1G21\n', '!']);
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
+      expect(data(writes)[2]).toBe('{"qr":""}\n');
       expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
       expect(controller.sender.state.hold).toBe(true);
     });
@@ -455,9 +485,11 @@ describe('TinyGController', () => {
       controller.command('gcode:pause');
       controller.command('gcode:resume');
 
-      expect(data(writes)).toEqual(['N1G21\n', '!\n', '{"qr":""}\n', '~\n', 'N2G90\n', '{"qr":""}\n']);
-      expect(controller.workflow.state).toBe(WORKFLOW_STATE_RUNNING);
+      expect(data(writes)).toEqual(['N1G21\n', '!', '~']);
       expect(controller.sender.state.hold).toBe(false);
+      drainFeeder(controller);
+      expect(data(writes)).toContain('N2G90\n');
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_RUNNING);
     });
 
     test('gcode:stop without force only reports the queue', () => {
@@ -467,14 +499,16 @@ describe('TinyGController', () => {
       controller.command('gcode:start');
       controller.command('gcode:stop');
 
-      expect(data(writes)).toEqual(['N1G21\n', '{"qr":""}\n']);
+      expect(data(writes)).toEqual(['N1G21\n']);
+      drainFeeder(controller);
+      expect(data(writes)[1]).toBe('{"qr":""}\n');
       expect(controller.workflow.state).toBe(WORKFLOW_STATE_IDLE);
     });
 
     test.each([
-      [undefined, ['!\n', '%\n', 'M30\n', '{"qr":""}\n']],
-      [100.04, ['\x04\n', 'M30\n', '{"qr":""}\n']],
-      [101.02, ['\x04\n', '{"qr":""}\n']],
+      [undefined, ['!', '%', 'M30\n', '{"qr":""}\n']],
+      [100.04, ['\x04', 'M30\n', '{"qr":""}\n']],
+      [101.02, ['\x04', '{"qr":""}\n']],
     ])('gcode:stop with force and firmware build %p kills the job accordingly', (fb, expected) => {
       const { controller, writes } = setupController();
 
@@ -484,6 +518,7 @@ describe('TinyGController', () => {
       }
       controller.command('gcode:stop', { force: true });
 
+      drainFeeder(controller);
       expect(data(writes)).toEqual(expected);
     });
 
@@ -932,13 +967,15 @@ describe('TinyGController', () => {
       expect(stats.maxOutstanding).toBe(1);
     });
 
-    test('a command without a reply times out and the setup continues', async () => {
+    test('a command without a reply stops setup until reconnect', async () => {
       const { controller, writes } = setupController();
       respondToWrites(controller, writes, (line) => ((line === '{spe:n}') ? null : '{"r":{},"f":[1,0,5]}'));
 
       await controller.initController();
 
-      expect(data(writes).map((line) => line.trim())).toEqual(setupCommands);
+      expect(data(writes).map(line => line.trim())).toEqual(setupCommands.slice(0, 8));
+      expect(controller.ready).toBe(false);
+      expect(controller.transport.failed).toBe(true);
     });
 
     // In ALARM a SET is answered with status 204 (newer firmware) and a GET still works.
@@ -961,7 +998,7 @@ describe('TinyGController', () => {
       expect(controller.setup.rejected).toBe(true);
       expect(events.some((entry) => entry.event === 'serialport:read' && /ALARM/.test(entry.args[0]))).toBe(true);
       expect(data(writes).some((line) => /clear/.test(line))).toBe(false);
-      expect(trigger).toHaveBeenCalledWith('controller:ready');
+      expect(trigger).not.toHaveBeenCalledWith('controller:ready');
 
       // Still in ALARM: nothing is sent
       const sentInAlarm = writes.length;
@@ -1009,10 +1046,13 @@ describe('TinyGController', () => {
     const program = Array.from({ length: 20 }, (v, i) => `G1 X${i}`).join('\n');
 
     // An idle board with firmware build `fb`; once {rxm:1} is set, every footer reports `free` line slots
-    const boardReply = ({ fb = 449.01, rxm = 0 }) => {
+    const boardReply = ({ fb = 450.02, rxm = 0 }) => {
       const board = { rxm, free: 10 };
       const footer = (status = 0) => (board.rxm ? `[3,${status},${board.free}]` : `[1,${status},5]`);
       return (line) => {
+        if (line === '{fb:n}') {
+          return `{"r":{"fb":${fb}},"f":${footer()}}`;
+        }
         if (line === '{sys:n}') {
           return `{"r":{"sys":{"fb":${fb},"fv":0.97}},"f":${footer()}}`;
         }
@@ -1045,8 +1085,11 @@ describe('TinyGController', () => {
     test.each([
       [440.21, false],
       [445.99, false],
-      [446.01, true],
-      [449.01, true],
+      [446.01, false],
+      [449.01, false],
+      [450.01, false],
+      [450.02, true],
+      [450.06, true],
       [101.02, false], // g2core
     ])('firmware build %p enables line mode: %p', async (fb, enabled) => {
       const { controller, writes } = setupController();
@@ -1058,6 +1101,13 @@ describe('TinyGController', () => {
       expect(lines.includes('{rxm:1}')).toBe(enabled);
       expect(lines.includes('{rx:n}')).toBe(enabled);
       expect(controller.lineMode).toBe(enabled);
+      const report = lines.find(line => line.startsWith('{sr:{'));
+      expect(report).not.toMatch(/tofx|admo/);
+      expect((report.match(/:t/g) || []).length).toBeLessThanOrEqual(30);
+      if (fb >= 450.06) {
+        expect(report).toContain('sse:t');
+        expect(report).toContain('ssc:t');
+      }
       expect(controller.sender.sp.type).toBe(enabled ? SP_TYPE_LINE_COUNTING : SP_TYPE_SEND_RESPONSE);
       if (enabled) {
         expect(controller.sender.sp.freeSlots).toBe(10);
@@ -1123,7 +1173,7 @@ describe('TinyGController', () => {
 
       // Queue reports do not block acknowledgements in line mode
       controller.runner.parse('{"qr":3}');
-      expect(controller.blocked).toBe(true);
+      expect(controller.sender.state.received).toBe(2);
       respond(controller, 3, 10);
       expect(controller.sender.state.received).toBe(3);
       expect(writes).toHaveLength(11);
@@ -1204,7 +1254,7 @@ describe('TinyGController', () => {
       controller.command('gcode:load', 'test.nc', program);
       controller.command('gcode:start');
       controller.command('gcode:pause');
-      expect(data(writes).slice(8)).toEqual(['!\n', '{"qr":""}\n']);
+      expect(data(writes).slice(8)).toEqual(['!', '{"qr":""}\n']);
 
       for (let n = 1; n <= 8; n++) {
         respond(controller, n, 10);
@@ -1212,9 +1262,10 @@ describe('TinyGController', () => {
       expect(writes).toHaveLength(10);
       expect(controller.sender.state.received).toBe(8);
 
+      controller.runner.parse('{"r":{"qr":28},"f":[3,0,10]}');
       controller.command('gcode:resume');
       expect(data(writes).slice(10)).toEqual([
-        '~\n',
+        '~',
         ...Array.from({ length: 8 }, (v, i) => `N${i + 9}G1X${i + 8}\n`),
         '{"qr":""}\n',
       ]);

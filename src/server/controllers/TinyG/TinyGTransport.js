@@ -1,0 +1,136 @@
+// TinyG's line footer counts headers, not bytes. Keep each burst below the
+// UART ring size, and retire its byte allocation only when the entire burst
+// has replied (a control response may overtake an older data allocation).
+export default class TinyGTransport {
+  constructor(write, fault) {
+    this.write = write;
+    this.fault = fault;
+    this.reset();
+  }
+
+  reset() {
+    const requests = [...(this.pending || []), ...(this.active || [])];
+    this.pending = [];
+    this.active = [];
+    this.bytes = 0;
+    this.slots = 0;
+    this.lineMode = false;
+    this.failed = false;
+    this.paused = false;
+    requests.forEach((request) => request.done && request.done(null));
+  }
+
+  enqueue(line, options = {}) {
+    line = String(line).trim();
+    const bytes = Buffer.byteLength(line + '\n');
+    // Include LF on the wire and leave room for the firmware's terminating NUL.
+    if (
+      !line ||
+      /[\r\n]/.test(line) ||
+      bytes > 249 ||
+      this.pending.length >= 64 ||
+      this.failed
+    ) {
+      this.fail(
+        'TinyG command rejected: invalid length, full queue, or transport requires reconnect'
+      );
+      if (options.done) {
+        options.done(null);
+      }
+      return;
+    }
+    const request = { ...options, line, bytes };
+    if (options.priority) {
+      this.pending.unshift(request);
+    } else {
+      this.pending.push(request);
+    }
+    this.pump();
+  }
+
+  fail(message) {
+    this.failed = true;
+    this.fault(message);
+  }
+
+  pump() {
+    if (this.pumping || this.failed) {
+      return;
+    }
+    this.pumping = true;
+    try {
+      while (this.pending.length) {
+        if (this.paused && this.pending[0].n) {
+          const controlIndex = this.pending.findIndex(request => !request.n);
+          if (controlIndex < 0) {
+ break;
+}
+          this.pending.unshift(...this.pending.splice(controlIndex, 1));
+        }
+        const request = this.pending[0];
+        const control = !request.n;
+        if (this.active.length) {
+          if (
+            !this.lineMode ||
+            this.bytes + request.bytes > (control ? 200 : 136)
+          ) {
+            break;
+          }
+          // At most one control transaction; only JSON controls may overtake data.
+          if (
+            control &&
+            (request.line[0] !== '{' || this.active.some((r) => !r.n))
+          ) {
+            break;
+          }
+          if (this.slots - this.active.length <= (control ? 0 : 2)) {
+            break;
+          }
+        }
+        this.pending.shift();
+        this.active.push(request);
+        this.bytes += request.bytes;
+        this.write(request.line + '\n');
+      }
+    } finally {
+      this.pumping = false;
+    }
+  }
+
+  receive(data) {
+    if (!Array.isArray(data.f) || !this.active.length || this.failed) {
+      return;
+    }
+    const n = data.r && Number(data.r.n);
+    let index = this.active.findIndex((r) => r.n && r.n === n);
+    if (index < 0) {
+      // Never guess ownership of a footer-only error with multiple requests.
+      const controls = this.active.filter((r) => !r.n);
+      const response = data.r || {};
+      const control = controls[0];
+      if (
+        control &&
+        !n &&
+        (this.active.length === 1 ||
+          Object.keys(response).includes((control.line.match(/^[{]\s*["']?([a-z0-9]+)["']?\s*:/i) || [])[1]))
+      ) {
+        index = this.active.indexOf(control);
+      } else if (this.active.length === 1 && !n && data.f[1] && Object.keys(response).length === 0) {
+        index = 0;
+      }
+    }
+    if (index < 0) {
+      this.fail('Unmatched TinyG reply; reconnect before continuing');
+      return;
+    }
+    const [request] = this.active.splice(index, 1);
+    this.slots = data.f[0] === 3 ? Number(data.f[2]) : 0;
+    if (!this.active.length) {
+      this.bytes = 0;
+    }
+    if (request.done) {
+      request.done(data);
+    }
+    this.pump();
+  }
+}

@@ -16,7 +16,6 @@ import MessageSlot from '../../lib/MessageSlot';
 import Sender, { SP_TYPE_LINE_COUNTING, SP_TYPE_SEND_RESPONSE } from '../../lib/Sender';
 import Workflow, {
   WORKFLOW_STATE_IDLE,
-  WORKFLOW_STATE_PAUSED,
   WORKFLOW_STATE_RUNNING
 } from '../../lib/Workflow';
 import delay from '../../lib/delay';
@@ -50,22 +49,17 @@ import * as builtinCommand from '../utils/builtin-command';
 import { isM0, isM1, isM6, replaceM6 } from '../utils/gcode';
 import { in2mm, mapPositionToUnits, mapValueToUnits } from '../utils/units';
 import TinyGRunner from './TinyGRunner';
+import TinyGTransport from './TinyGTransport';
 import {
   TINYG,
   TINYG_LINE_MODE_MIN_FIRMWARE_BUILD,
   TINYG_LINE_MODE_RESERVE,
   TINYG_MACHINE_STATE_ALARM,
   TINYG_MACHINE_STATE_SHUTDOWN,
-  TINYG_PLANNER_BUFFER_LOW_WATER_MARK,
-  TINYG_PLANNER_BUFFER_HIGH_WATER_MARK,
-  TINYG_SERIAL_BUFFER_LIMIT,
   TINYG_SETUP_RESPONSE_TIMEOUT,
-  TINYG_STATUS_CODES
 } from './constants';
 
 const SENDER_STATUS_NONE = 'none';
-const SENDER_STATUS_NEXT = 'next';
-const SENDER_STATUS_ACK = 'ack';
 
 const log = logger('controller:TinyG');
 const noop = () => {};
@@ -113,6 +107,14 @@ class TinyGController {
     // TinyG
     tinyg = null;
 
+    transport = null;
+
+    overridePending = {};
+
+    overrideBusy = false;
+
+    programEpoch = 0;
+
     ready = false;
 
     state = {};
@@ -130,7 +132,6 @@ class TinyGController {
       plan: true, // plane select
       path: true, // path control mode
       dist: true, // distance mode
-      admo: true, // arc distance mode
       frmo: true, // feed rate mode
       tool: true, // active tool
       posx: true,
@@ -151,13 +152,6 @@ class TinyGController {
       sps: true, // [edge-082.10] Spindle speed
       com: true, // [edge-082.10] Mist coolant
       cof: true, // [edge-082.10] Flood coolant
-      // Tool table offsets
-      tofx: true,
-      tofy: true,
-      tofz: true,
-      tofa: true,
-      tofb: true,
-      tofc: true,
     };
 
     timer = {
@@ -230,12 +224,12 @@ class TinyGController {
       }
       this.engine = engine;
 
-      const { port, baudrate, rtscts, pin } = { ...options };
+      const { port, baudrate, pin } = { ...options };
       this.options = {
         ...this.options,
         port: port,
         baudrate: baudrate,
-        rtscts: rtscts,
+        rtscts: false,
         pin,
       };
 
@@ -243,10 +237,16 @@ class TinyGController {
       this.connection = new SerialConnection({
         path: port,
         baudRate: baudrate,
-        rtscts: rtscts,
+        rtscts: false,
         writeFilter: (data) => {
           return data;
         }
+      });
+
+      this.transport = new TinyGTransport(data => this.connection.write(data), message => {
+        this.ready = false;
+        this.sender.hold();
+        this.emit('serialport:read', message);
       });
 
       // Message Slot
@@ -390,7 +390,11 @@ class TinyGController {
           source: WRITE_SOURCE_FEEDER
         });
 
-        this.connection.write(line + '\n');
+        this.transport.enqueue(line, { done: response => {
+          if (response) {
+            this.feeder.next();
+          }
+} });
         log.silly(`> ${line}`);
       });
       this.feeder.on('hold', noop);
@@ -530,7 +534,23 @@ class TinyGController {
         line = ('' + line).replace(/^N[0-9]*/, '');
         line = ('N' + n + line);
 
-        this.connection.write(line + '\n');
+        const epoch = this.programEpoch;
+        this.transport.enqueue(line, {
+          n,
+          done: response => {
+            if (!response || epoch !== this.programEpoch) {
+              return;
+            }
+            this.responseLineNumber = n;
+            this.sender.ack();
+            if (response.f[1] && !config.get('state.controller.exception.ignoreErrors')) {
+              this.emit('serialport:read', `> ${this.sender.state.lines[n - 1].trim()} (ln=${n + 1})`);
+              this.workflow.pause({ err: true, msg: `TinyG error ${response.f[1]} at N${n}` });
+            } else if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
+              this.sender.next();
+            }
+          }
+        });
         log.silly(`data: n=${n}, line="${line}"`);
       });
       this.sender.on('hold', noop);
@@ -545,18 +565,23 @@ class TinyGController {
       // Workflow
       this.workflow = new Workflow();
       this.workflow.on('start', (...args) => {
+        this.transport.paused = false;
         this.emit('workflow:state', this.workflow.state);
         this.blocked = false;
         this.senderStatus = SENDER_STATUS_NONE;
         this.sender.rewind();
       });
       this.workflow.on('stop', (...args) => {
+        this.programEpoch++;
+        this.transport.paused = true;
+        this.transport.pending = this.transport.pending.filter(request => !request.n);
         this.emit('workflow:state', this.workflow.state);
         this.blocked = false;
         this.senderStatus = SENDER_STATUS_NONE;
         this.sender.rewind();
       });
       this.workflow.on('pause', (...args) => {
+        this.transport.paused = true;
         this.emit('workflow:state', this.workflow.state);
 
         if (args.length > 0) {
@@ -567,6 +592,8 @@ class TinyGController {
         }
       });
       this.workflow.on('resume', (...args) => {
+        this.transport.paused = false;
+        this.transport.pump();
         this.emit('workflow:state', this.workflow.state);
 
         // Reset feeder prior to resume program execution
@@ -708,133 +735,37 @@ class TinyGController {
             }
           }
         }
-
-        const { hold, sent, received } = this.sender.state;
-
-        if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
-          const n = _.get(r, 'r.n') || _.get(r, 'n');
-
-          // Line mode: several lines are in flight, paced by the free line slots in the response footer.
-          // The planner queue reports do not block acknowledgements here: a board whose planner is full
-          // stops reading lines, and the free line slots it reports drop.
-          if (this.lineMode) {
-            const ignoreErrors = config.get('state.controller.exception.ignoreErrors');
-            const pauseError = (this.runner.footer.statusCode !== 0) && !ignoreErrors;
-            log.silly(`ack: n=${n}, hold=${hold}, sent=${sent}, received=${received}, free=${this.runner.footer.rxBufferInfo}`);
-            this.responseLineNumber = n;
-            this.updateFreeSlots();
-            this.sender.ack();
-            if (!pauseError) {
-              // On an error the 'f' handler pauses the program: send nothing past the failed line
-              this.sender.next();
-            }
-            this.senderStatus = SENDER_STATUS_NEXT;
-            return;
-          }
-
-          if (n !== sent) {
-            log.warn(`Expression: n (${n}) === sent (${sent})`);
-          }
-          log.silly(`ack: n=${n}, blocked=${this.blocked}, hold=${hold}, sent=${sent}, received=${received}`);
-          this.senderStatus = SENDER_STATUS_ACK;
-          if (!this.blocked) {
-            this.sender.ack();
-            this.sender.next();
-            this.senderStatus = SENDER_STATUS_NEXT;
-          }
-          return;
-        }
-
-        // The execution can be manually paused or issue a M0 command to pause
-        // * M0, M1 Program Pause
-        // * M2, M30 Program End
-        // * M6 Tool Change
-        if ((this.workflow.state === WORKFLOW_STATE_PAUSED) && (received < sent)) {
-          if (!hold) {
-            log.error('The sender does not hold off during the paused state');
-          }
-          if (received + 1 >= sent) {
-            log.debug(`Stop sending G-code: hold=${hold}, sent=${sent}, received=${received + 1}`);
-          }
-          const n = _.get(r, 'r.n') || _.get(r, 'n');
-          if (!this.lineMode && (n !== sent)) {
-            log.warn(`Expression: n (${n}) === sent (${sent})`);
-          }
-          log.silly(`ack: n=${n}, blocked=${this.blocked}, hold=${hold}, sent=${sent}, received=${received}`);
-          this.senderStatus = SENDER_STATUS_ACK;
-          this.sender.ack();
-          this.sender.next();
-          this.senderStatus = SENDER_STATUS_NEXT;
-          return;
-        }
-
-        console.assert(this.workflow.state !== WORKFLOW_STATE_RUNNING, `workflow.state !== '${WORKFLOW_STATE_RUNNING}'`);
-
-        // Feeder
-        this.feeder.next();
       });
 
       this.runner.on('qr', ({ qr }) => {
-        log.silly(`planner queue: qr=${qr}, lw=${TINYG_PLANNER_BUFFER_LOW_WATER_MARK}, hw=${TINYG_PLANNER_BUFFER_HIGH_WATER_MARK}`);
-
         this.state.qr = qr;
-
-        if (qr <= TINYG_PLANNER_BUFFER_LOW_WATER_MARK) {
-          this.blocked = true;
-          return;
-        }
-
-        if (qr >= TINYG_PLANNER_BUFFER_HIGH_WATER_MARK) {
-          this.blocked = false;
-        }
-
-        if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
-          const { hold, sent, received } = this.sender.state;
-          log.silly(`sender: status=${this.senderStatus}, hold=${hold}, sent=${sent}, received=${received}`);
-          if (this.senderStatus === SENDER_STATUS_NEXT) {
-            if (hold && (received >= sent) && (qr >= this.runner.plannerBufferPoolSize)) {
-              log.debug(`Continue sending G-code: hold=${hold}, sent=${sent}, received=${received}, qr=${qr}`);
-              this.sender.unhold();
-              this.sender.next();
-              this.senderStatus = SENDER_STATUS_NEXT;
-            }
-          } else if (this.senderStatus === SENDER_STATUS_ACK) {
-            this.sender.ack();
-            this.sender.next();
-            this.senderStatus = SENDER_STATUS_NEXT;
-          }
-          return;
-        }
-
-        // The execution is manually paused
-        if ((this.workflow.state === WORKFLOW_STATE_PAUSED) && (this.senderStatus === SENDER_STATUS_ACK)) {
-          const { hold, sent, received } = this.sender.state;
-          log.silly(`sender: status=${this.senderStatus}, hold=${hold}, sent=${sent}, received=${received}`);
-          if (received >= sent) {
-            log.error(`Expression: received (${received}) < sent (${sent})`);
-          }
-          if (!hold) {
-            log.error('The sender does not hold off during the paused state');
-          }
-          if (received + 1 >= sent) {
-            log.debug(`Stop sending G-code: hold=${hold}, sent=${sent}, received=${received + 1}`);
-          }
-          this.sender.ack();
+        if (qr >= this.runner.plannerBufferPoolSize && this.sender.state.hold &&
+            this.workflow.state === WORKFLOW_STATE_RUNNING && this.sender.state.received >= this.sender.state.sent) {
+          this.sender.unhold();
           this.sender.next();
-          this.senderStatus = SENDER_STATUS_NEXT;
+        }
+      });
+
+      this.runner.on('response', data => {
+        if (data.r && data.r.msg === 'SYSTEM READY') {
+          this.transport.reset();
+          this.overridePending = {};
+          this.overrideBusy = false;
+          this.lineMode = false;
+          this.runner.settings = { ...this.runner.settings, mfo: 1, sso: 1 };
+          if (!this.setup.running) {
+            this.initController();
+          }
           return;
         }
-
-        console.assert(this.workflow.state !== WORKFLOW_STATE_RUNNING, `workflow.state !== '${WORKFLOW_STATE_RUNNING}'`);
-
-        // Feeder
-        if (this.feeder.state.hold) {
-          const { data } = { ...this.feeder.state.holdReason };
-          if ((data === BUILTIN_COMMAND_WAIT) && (qr >= this.runner.plannerBufferPoolSize)) {
-            this.feeder.unhold();
-          }
+        if (data.f[1] === 100 && data.r) {
+          Object.keys(data.r).forEach(key => {
+            if (key in this.sr) {
+              this.sr[key] = false;
+            }
+});
         }
-        this.feeder.next();
+        this.transport.receive(data);
       });
 
       this.runner.on('sr', (sr) => {
@@ -852,47 +783,7 @@ class TinyGController {
       this.runner.on('hp', (hp) => {
       });
 
-      this.runner.on('f', (f) => {
-        const responseLineNumber = this.responseLineNumber;
-        this.responseLineNumber = 0;
-        this.updateFreeSlots();
-
-        // https://github.com/synthetos/g2/wiki/Status-Codes
-        const statusCode = f[1] || 0;
-
-        if (statusCode !== 0) {
-          const code = Number(statusCode);
-          const error = _.find(TINYG_STATUS_CODES, { code: code }) || {};
-
-          if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
-            const ignoreErrors = config.get('state.controller.exception.ignoreErrors');
-            const pauseError = !ignoreErrors;
-            const { lines, received } = this.sender.state;
-            // In line mode the failed line is the one numbered n, not necessarily the last line answered
-            const index = (this.lineMode && responseLineNumber > 0) ? (responseLineNumber - 1) : (received - 1);
-            const line = ensureString(lines[index]).trim();
-            const ln = index + 2;
-
-            this.emit('serialport:read', `> ${line} (ln=${ln})`);
-            this.emit('serialport:read', `error:${code} (${error.msg})`);
-
-            if (pauseError) {
-              this.workflow.pause({
-                err: true,
-                msg: error.msg,
-              });
-            }
-
-            return;
-          }
-
-          this.emit('serialport:read', `error:${code} (${error.msg})`);
-        }
-
-        if (this.workflow.state === WORKFLOW_STATE_IDLE) {
-          this.feeder.next();
-        }
-      });
+      this.runner.on('f', () => this.updateFreeSlots());
 
       // Query Timer
       this.timer.query = setInterval(() => {
@@ -935,6 +826,15 @@ class TinyGController {
           return;
         }
 
+        if (Number(this.runner.settings.fb) >= 450.06 && !this.spindlePollPending &&
+            Date.now() - (this.spindlePollTime || 0) >= 1000) {
+          this.spindlePollPending = true;
+          this.spindlePollTime = Date.now();
+          this.transport.enqueue('{sso:null,ssc:null,sse:null}', { done: () => {
+            this.spindlePollPending = false;
+          } });
+        }
+
         // Check if the machine has stopped movement after completion
         if (this.actionTime.senderFinishTime > 0) {
           const machineIdle = zeroOffset && this.runner.isIdle();
@@ -966,47 +866,29 @@ class TinyGController {
       // previous one ("always run configuration commands synchronously" - Tinyg Communications
       // Programming). A missing reply times out so that a silent board cannot hang the setup.
       let rejected = false;
-      const waitForResponse = (timeout) => new Promise((resolve) => {
-        const runner = this.runner;
-        let timer = null;
-        const onFooter = (f) => {
+      const send = (cmd = '', optional = false) => new Promise((resolve, reject) => {
+        if (this.isClose() || this.transport.failed) {
+          reject(new Error('TinyG connection unavailable')); return;
+        }
+        const timer = setTimeout(() => {
+          this.transport.fail('TinyG setup timed out; reconnect before continuing');
+          reject(new Error('TinyG setup timed out'));
+        }, TINYG_SETUP_RESPONSE_TIMEOUT);
+        this.transport.enqueue(cmd, { done: response => {
           clearTimeout(timer);
-          runner.removeListener('f', onFooter);
+          if (!response) {
+            reject(new Error('TinyG setup cancelled')); return;
+          }
+          const f = response.f;
+          if ([204, 205].includes(Number(f[1]))) {
+            rejected = true;
+          }
+          if (f[1] && !optional) {
+            reject(new Error(`TinyG setup rejected${rejected ? ' in ALARM' : ''} (${f[1]}): ${cmd}`)); return;
+          }
           resolve(f);
-        };
-        timer = setTimeout(() => {
-          runner.removeListener('f', onFooter);
-          resolve(null);
-        }, timeout);
-        runner.on('f', onFooter);
+        } });
       });
-      const send = async (cmd = '') => {
-        if (this.isClose()) {
-          // Serial port is closed
-          return null;
-        }
-
-        cmd = String(cmd);
-
-        if (cmd.length >= TINYG_SERIAL_BUFFER_LIMIT) {
-          log.error(`Exceeded serial buffer limit (${TINYG_SERIAL_BUFFER_LIMIT}): cmd=${cmd}`);
-          return null;
-        }
-
-        log.silly(`init: ${cmd} ${cmd.length}`);
-        const response = waitForResponse(TINYG_SETUP_RESPONSE_TIMEOUT);
-        this.command('gcode', cmd);
-
-        const f = await response;
-        if (!f) {
-          log.warn(`No response within ${TINYG_SETUP_RESPONSE_TIMEOUT}ms: cmd=${cmd}`);
-        }
-        if (f && [204, 205].includes(Number(f[1]))) {
-          // 204: Command rejected by ALARM, 205: Command rejected by SHUTDOWN
-          rejected = true;
-        }
-        return f;
-      };
       const relaxedJSON = (json) => {
         if (typeof json === 'object') {
           json = JSON.stringify(json);
@@ -1014,106 +896,134 @@ class TinyGController {
         return json.replace(/"/g, '').replace(/true/g, 't');
       };
 
+      if (this.setup.running) {
+        return;
+      }
       this.setup.running = true;
+      this.ready = false;
+      try {
+        await send('{fb:n}');
 
-      // Enable JSON mode
-      // 0=text mode, 1=JSON mode
-      await send('{ej:1}');
+        // Enable JSON mode
+        // 0=text mode, 1=JSON mode
+        await send('{ej:1}');
 
-      // JSON verbosity
-      // 0=silent, 1=footer, 2=messages, 3=configs, 4=linenum, 5=verbose
-      await send('{jv:4}');
+        // JSON verbosity
+        // 0=silent, 1=footer, 2=messages, 3=configs, 4=linenum, 5=verbose
+        await send('{jv:5}');
+        await send('{ex:0}');
 
-      // Queue report verbosity
-      // 0=off, 1=filtered, 2=verbose
-      await send('{qv:1}');
+        // Queue report verbosity
+        // 0=off, 1=filtered, 2=verbose
+        await send('{qv:1}');
 
-      // Status report verbosity
-      // 0=off, 1=filtered, 2=verbose
-      await send('{sv:1}');
+        // Status report verbosity
+        // 0=off, 1=filtered, 2=verbose
+        await send('{sv:1}');
 
-      // Status report interval
-      // Set the status interval to 200ms
-      await send('{si:200}');
+        // Status report interval
+        // Set the status interval to 200ms
+        await send('{si:200}');
 
-      // Check whether the spindle and coolant commands are supported
-      await send('{spe:n}');
-      await send('{spd:n}');
-      await send('{spc:n}');
-      await send('{sps:n}');
-      await send('{com:n}');
-      await send('{cof:n}');
+        // Check whether the spindle and coolant commands are supported
+        await send('{spe:n}', true);
+        await send('{spd:n}', true);
+        await send('{spc:n}', true);
+        await send('{sps:n}', true);
+        await send('{com:n}', true);
+        await send('{cof:n}', true);
 
-      // Settings Status Report Fields
-      // https://github.com/synthetos/TinyG/wiki/TinyG-Status-Reports#setting-status-report-fields
-      // Note: The JSON string is minified to make sure the length won't exceed the serial buffer limit
-      await send(relaxedJSON({
-        // Returns an object composed of the picked properties
-        sr: _.pickBy(this.sr, (value, key) => {
-          return !!value;
-        })
-      }));
+        // Settings Status Report Fields
+        // https://github.com/synthetos/TinyG/wiki/TinyG-Status-Reports#setting-status-report-fields
+        // Note: The JSON string is minified to make sure the length won't exceed the serial buffer limit
+        const build = Number(this.runner.settings.fb);
+        // Keep the base report within 30 fields; feed changes use standalone events.
+        if (build >= 450.06) {
+          this.sr.sse = true;
+          this.sr.ssc = true;
+        }
+        await send(relaxedJSON({
+          // Returns an object composed of the picked properties
+          sr: _.pickBy(this.sr, (value, key) => {
+            return !!value;
+          })
+        }));
 
-      // Request system settings
-      await send('{sys:n}');
+        // Request system settings
+        await send('{sys:n}');
 
-      if (this.isClose()) {
-        return;
+        if (this.isClose()) {
+          return;
+        }
+
+        // RX line (packet) mode, firmware build 450.02 and later: the board queues whole lines and
+        // every response footer becomes [3, status, free line slots] ("Sending Data to TinyG using RX
+        // Packet Mode"). rxm is a persisted setting. Status 0 does not prove the board switched: build
+        // 449 ignores settings in ALARM, so the footer revision is checked again on every response.
+        this.lineMode = false;
+        const lineModeEnabled = config.get('state.controller.tinyg.lineMode', true);
+        const firmwareBuild = ensureNumber(_.get(this.runner.settings, 'fb'));
+        if (lineModeEnabled && (firmwareBuild >= TINYG_LINE_MODE_MIN_FIRMWARE_BUILD)) {
+          const f = await send('{rxm:1}');
+          this.lineMode = !!f && (Number(f[1]) === 0);
+        }
+        this.transport.lineMode = this.lineMode;
+        this.sender.setStreamingProtocol(this.lineMode ? SP_TYPE_LINE_COUNTING : SP_TYPE_SEND_RESPONSE, {
+          reserve: TINYG_LINE_MODE_RESERVE,
+        });
+        if (this.lineMode) {
+          // Request the free line slots
+          await send('{rx:n}');
+        }
+
+        // Request motor timeout
+        await send('{mt:n}');
+
+        // Request motor states
+        await send('{pwr:n}');
+
+        // Request queue report
+        await send('{qr:n}');
+
+        // Request status report
+        await send('{sr:n}');
+        if (build >= 450.05) {
+          await send('{rt:{ov:1}}');
+          await send('{mfo:null,mfc:null,mfe:null}');
+        }
+        if (build >= 450.06) {
+          await send('{sso:null,ssc:null,sse:null}');
+        }
+
+        if (this.isClose()) {
+          return;
+        }
+
+        // Settings are rejected while the board is in ALARM or SHUTDOWN: newer firmware replies with
+        // status 204 or 205, build 449 and earlier ignore them without an error. The alarm is not
+        // cleared here; the settings are applied again after the user clears it (see the 'sr' handler).
+        const machineState = _.get(this.runner.state, 'sr.machineState');
+        if (rejected || [TINYG_MACHINE_STATE_ALARM, TINYG_MACHINE_STATE_SHUTDOWN].includes(machineState)) {
+          this.setup.rejected = true;
+          log.warn(`Settings were not applied in machine state ${machineState}; they will be applied after the alarm is cleared`);
+          this.emit('serialport:read', 'TinyG is in ALARM: the settings will be applied after the alarm is cleared');
+        }
+
+        this.ready = !this.setup.rejected;
+        if (reapply) {
+          return;
+        }
+
+        await delay(50);
+        this.ready = !this.setup.rejected;
+        this.event.trigger('controller:ready');
+      } catch (err) {
+        this.ready = false;
+        this.setup.rejected = rejected;
+        this.emit('serialport:read', err.message);
+      } finally {
+        this.setup.running = false;
       }
-
-      // RX line (packet) mode, firmware build 446.xx and later: the board queues whole lines and
-      // every response footer becomes [3, status, free line slots] ("Sending Data to TinyG using RX
-      // Packet Mode"). rxm is a persisted setting. Status 0 does not prove the board switched: build
-      // 449 ignores settings in ALARM, so the footer revision is checked again on every response.
-      this.lineMode = false;
-      const lineModeEnabled = config.get('state.controller.tinyg.lineMode', true);
-      const firmwareBuild = ensureNumber(_.get(this.runner.settings, 'fb'));
-      if (lineModeEnabled && (firmwareBuild >= TINYG_LINE_MODE_MIN_FIRMWARE_BUILD)) {
-        const f = await send('{rxm:1}');
-        this.lineMode = !!f && (Number(f[1]) === 0);
-      }
-      this.sender.setStreamingProtocol(this.lineMode ? SP_TYPE_LINE_COUNTING : SP_TYPE_SEND_RESPONSE, {
-        reserve: TINYG_LINE_MODE_RESERVE,
-      });
-      if (this.lineMode) {
-        // Request the free line slots
-        await send('{rx:n}');
-      }
-
-      // Request motor timeout
-      await send('{mt:n}');
-
-      // Request motor states
-      await send('{pwr:n}');
-
-      // Request queue report
-      await send('{qr:n}');
-
-      // Request status report
-      await send('{sr:n}');
-
-      this.setup.running = false;
-
-      if (this.isClose()) {
-        return;
-      }
-
-      // Settings are rejected while the board is in ALARM or SHUTDOWN: newer firmware replies with
-      // status 204 or 205, build 449 and earlier ignore them without an error. The alarm is not
-      // cleared here; the settings are applied again after the user clears it (see the 'sr' handler).
-      const machineState = _.get(this.runner.state, 'sr.machineState');
-      if (rejected || [TINYG_MACHINE_STATE_ALARM, TINYG_MACHINE_STATE_SHUTDOWN].includes(machineState)) {
-        this.setup.rejected = true;
-        log.warn(`Settings were not applied in machine state ${machineState}; they will be applied after the alarm is cleared`);
-        this.emit('serialport:read', 'TinyG is in ALARM: the settings will be applied after the alarm is cleared');
-      }
-
-      if (reapply) {
-        return;
-      }
-
-      await delay(50);
-      this.event.trigger('controller:ready');
     }
 
     // A line mode footer is [3, status, free line slots]. A character mode footer, [2, status, bytes],
@@ -1123,7 +1033,65 @@ class TinyGController {
         return;
       }
       const { revision, rxBufferInfo } = this.runner.footer;
+      this.transport.lineMode = revision === 3;
       this.sender.sp.freeSlots = (revision === 3) ? rxBufferInfo : 0;
+    }
+
+    changeOverride(key, step) {
+      const fb = Number(this.runner.settings.fb);
+      if (!this.ready || !Number.isFinite(fb) || !Number.isFinite(step) || fb < (key === 'mfo' ? 450.05 : 450.06)) {
+        return;
+      }
+      const current = this.overridePending[key] ?? this.runner.settings[key];
+      if (!Number.isFinite(current)) {
+        return;
+      }
+      this.overridePending[key] = step === 0 ? 1 : Math.max(0.05, Math.min(2, Math.round(current * 100 + step) / 100));
+      this.sendOverride();
+    }
+
+    sendOverride() {
+      if (this.overrideBusy) {
+        return;
+      }
+      const key = Object.keys(this.overridePending)[0];
+      if (!key) {
+        return;
+      }
+      const value = this.overridePending[key];
+      this.overrideBusy = true;
+      this.transport.enqueue(JSON.stringify({ [key]: value }), {
+        priority: true,
+        done: (response) => {
+          if (!response) {
+            this.overridePending = {};
+            this.overrideBusy = false;
+            return;
+          }
+          const failed = response.f[1] !== 0;
+          if (failed || this.overridePending[key] === value) {
+            delete this.overridePending[key];
+          }
+          if (failed) {
+            this.emit('serialport:read', `TinyG override rejected (${response.f[1]})`);
+          }
+          // A SET acknowledges acceptance, not application. Read authoritative state,
+          // including after 104/110; failure is reported without an endless retry.
+          const fields = key === 'mfo' ? { mfo: null, mfc: null, mfe: null } : { sso: null, ssc: null, sse: null };
+          this.transport.enqueue(JSON.stringify(fields), {
+            priority: true,
+            done: (result) => {
+              this.overrideBusy = false;
+              if (!result || result.f[1]) {
+                this.overridePending = {};
+                this.emit('serialport:read', 'TinyG override readback failed');
+                return;
+              }
+              this.sendOverride();
+            }
+          });
+        }
+      });
     }
 
     populateContext(context) {
@@ -1209,6 +1177,9 @@ class TinyGController {
     }
 
     destroy() {
+      if (this.transport) {
+        this.transport.reset();
+      }
       if (this.timer.query) {
         clearInterval(this.timer.query);
         this.timer.query = null;
@@ -1348,7 +1319,7 @@ class TinyGController {
         }
 
         // Set ready flag to true
-        this.ready = true;
+        this.ready = false;
 
         // Initialize controller
         this.initController();
@@ -1367,6 +1338,7 @@ class TinyGController {
 
       // Stop status query
       this.ready = false;
+      this.transport.reset();
 
       this.emit('serialport:close', {
         port: port,
@@ -1473,6 +1445,9 @@ class TinyGController {
     // ^d           Kill Job        Trigger ALARM to kill current job. Send {clear:n}, M2 or M30 to end ALARM state
     // ^x           Reset Board     Perform hardware reset to restart the board
     command(cmd, ...args) {
+      if (this.setup.running && !['reset', 'feedhold'].includes(cmd)) {
+        return;
+      }
       const handler = {
         'gcode:load': () => {
           let [name, gcode, context = {}, callback = noop] = args;
@@ -1515,6 +1490,9 @@ class TinyGController {
           this.command('gcode:start');
         },
         'gcode:start': () => {
+          if (!this.ready || this.setup.running || this.transport.failed || this.transport.active.length || this.transport.pending.length) {
+            return;
+          }
           this.event.trigger('gcode:start');
 
           this.workflow.start();
@@ -1640,52 +1618,9 @@ class TinyGController {
         },
         // Feed Overrides
         // @param {number} value A percentage value between 5 and 200. A value of zero will reset to 100%.
-        'feedOverride': () => {
-          const [value] = args;
-          let mfo = this.runner.settings.mfo;
-
-          if (value === 0) {
-            mfo = 1;
-          } else if ((mfo * 100 + value) > 200) {
-            mfo = 2;
-          } else if ((mfo * 100 + value) < 5) {
-            mfo = 0.05;
-          } else {
-            mfo = (mfo * 100 + value) / 100;
-          }
-
-          this.command('gcode', `{mfo:${mfo}}`);
-        },
-        // Spindle Speed Overrides
-        // @param {number} value A percentage value between 5 and 200. A value of zero will reset to 100%.
-        'spindleOverride': () => {
-          const [value] = args;
-          let sso = this.runner.settings.sso;
-
-          if (value === 0) {
-            sso = 1;
-          } else if ((sso * 100 + value) > 200) {
-            sso = 2;
-          } else if ((sso * 100 + value) < 5) {
-            sso = 0.05;
-          } else {
-            sso = (sso * 100 + value) / 100;
-          }
-
-          this.command('gcode', `{sso:${sso}}`);
-        },
-        // Rapid Overrides
-        'rapidOverride': () => {
-          const [value] = args;
-
-          if (value === 0 || value === 100) {
-            this.command('gcode', '{mto:1}');
-          } else if (value === 50) {
-            this.command('gcode', '{mto:0.5}');
-          } else if (value === 25) {
-            this.command('gcode', '{mto:0.25}');
-          }
-        },
+        'feedOverride': () => this.changeOverride('mfo', args[0]),
+        'spindleOverride': () => this.changeOverride('sso', args[0]),
+        'rapidOverride': noop, // TinyG has no rapid override token.
         'energizeMotors:on': () => {
           const { mt = 0 } = this.state;
 
@@ -2125,11 +2060,27 @@ class TinyGController {
         return;
       }
 
+      const realtime = ['!', '~', '%', '\x04', '\x18'].includes(String(data).trim());
+      if (this.setup.running && !realtime) {
+        return;
+      }
       this.emit('serialport:write', data, {
         ...context,
         source: WRITE_SOURCE_CLIENT
       });
-      this.connection.write(data);
+      if (realtime) {
+        if (data.trim() === '\x18' || data.trim() === '\x04') {
+          this.overridePending = {};
+          this.overrideBusy = false;
+          this.transport.reset();
+          this.lineMode = false;
+          this.ready = false;
+          this.runner.settings = { ...this.runner.settings, mfo: 1, sso: 1 };
+        }
+        this.connection.write(data.trim());
+        return;
+      }
+      String(data).split(/\r?\n/).filter(line => line.trim()).forEach(line => this.transport.enqueue(line));
       log.silly(`> ${data}`);
     }
 

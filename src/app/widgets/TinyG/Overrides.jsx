@@ -1,15 +1,14 @@
 import PropTypes from 'prop-types';
 import React from 'react';
 import RepeatButton from 'app/components/RepeatButton';
-import Space from 'app/components/Space';
 import controller from 'app/lib/controller';
 import DigitalReadout from './DigitalReadout';
 import styles from './index.styl';
 
 const Overrides = (props) => {
-  const { ovF, ovS, ovT } = props;
+  const { ovF, ovS } = props;
 
-  if (!ovF && !ovS && !ovT) {
+  if (!ovF && !ovS) {
     return null;
   }
 
@@ -141,54 +140,13 @@ const Overrides = (props) => {
           </button>
         </DigitalReadout>
       )}
-      {!!ovT && (
-        <DigitalReadout label="T" value={ovT + '%'}>
-          <button
-            aria-label="Trajectory planner 100%"
-            type="button"
-            className="btn btn-default"
-            onClick={() => {
-              controller.command('rapidOverride', 100);
-            }}
-          >
-            <i aria-hidden="true" className="fa fa-battery-full" />
-            <Space width="8" />
-            100%
-          </button>
-          <button
-            aria-label="Trajectory planner 50%"
-            type="button"
-            className="btn btn-default"
-            onClick={() => {
-              controller.command('rapidOverride', 50);
-            }}
-          >
-            <i aria-hidden="true" className="fa fa-battery-half" />
-            <Space width="8" />
-            50%
-          </button>
-          <button
-            aria-label="Trajectory planner 25%"
-            type="button"
-            className="btn btn-default"
-            onClick={() => {
-              controller.command('rapidOverride', 25);
-            }}
-          >
-            <i aria-hidden="true" className="fa fa-battery-quarter" />
-            <Space width="8" />
-            25%
-          </button>
-        </DigitalReadout>
-      )}
     </div>
   );
 };
 
 Overrides.propTypes = {
   ovF: PropTypes.number,
-  ovS: PropTypes.number,
-  ovT: PropTypes.number
+  ovS: PropTypes.number
 };
 
 export default Overrides;

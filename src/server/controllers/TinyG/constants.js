@@ -15,9 +15,9 @@ export const TINYG_SERIAL_BUFFER_LIMIT = 254;
 // How long to wait for the reply to each connect-time setup command (in milliseconds)
 export const TINYG_SETUP_RESPONSE_TIMEOUT = 1000;
 
-// RX line (packet) mode: firmware build 446.xx and later
+// RX line (packet) mode: firmware build 450.02 and later (N55 line-slot leak fixed)
 // https://github.com/synthetos/TinyG/wiki/Sending-Data-to-TinyG-using-RX-Packet-Mode
-export const TINYG_LINE_MODE_MIN_FIRMWARE_BUILD = 446;
+export const TINYG_LINE_MODE_MIN_FIRMWARE_BUILD = 450.02;
 // Line slots kept free for control commands (queue reports, overrides) while streaming
 export const TINYG_LINE_MODE_RESERVE = 2;
 

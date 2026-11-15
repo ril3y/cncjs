@@ -646,6 +646,6 @@
   "Drop files to upload": "Drop files to upload",
   "Uploading...": "Uploading...",
   "TinyG": "TinyG",
-  "Stream G-code in line mode with firmware build 446 or later": "Stream G-code in line mode with firmware build 446 or later",
+  "Stream G-code in line mode with firmware build 450.02 or later": "Stream G-code in line mode with firmware build 450.02 or later",
   "Keeps several lines in the receive buffer of the controller. Takes effect on the next connection.": "Keeps several lines in the receive buffer of the controller. Takes effect on the next connection."
 }

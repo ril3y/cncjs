@@ -151,6 +151,20 @@ class TinyGRunner extends events.EventEmitter {
           data = {};
         }
 
+        const overrideValues = data.ov || (data.r && data.r.sr) || data.sr ||
+          ((data.f && data.f[1] === 0 && data.r) ? data.r : {});
+        const overrideKeys = ['mfo', 'mfc', 'mfe', 'sso', 'ssc', 'sse'];
+        const updates = {};
+        overrideKeys.forEach(key => {
+          if (typeof overrideValues[key] === 'number') {
+            updates[key] = overrideValues[key];
+          }
+        });
+        if (Object.keys(updates).length) {
+          this.settings = { ...this.settings, ...updates };
+          this.emit('overrides', updates);
+        }
+
         const result = this.parser.parse(data) || {};
         const { type, payload } = result;
 
@@ -469,6 +483,7 @@ class TinyGRunner extends events.EventEmitter {
 
         if (payload.f && payload.f.length > 0) {
           this.emit('f', payload.f);
+          this.emit('response', data);
         }
       }
     }

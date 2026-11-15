@@ -45,7 +45,7 @@ class Laser extends PureComponent {
         scale = Number(ovS) || 0;
       }
       if (controllerType === TINYG) {
-        const ovS = _.get(controllerSettings, 'sso');
+        const ovS = Number(controllerSettings.fb) >= 450.06 ? controllerSettings.ssc : 0;
         scale = Math.round((Number(ovS) || 0) * 100);
       }
 
@@ -56,6 +56,7 @@ class Laser extends PureComponent {
       const { state, actions } = this.props;
       const none = '–';
       const { canClick, panel, test } = state;
+      const canOverride = canClick && (state.controller.type !== TINYG || Number(_.get(state, 'controller.settings.fb')) >= 450.06);
       const laserIntensityScale = this.getLaserIntensityScale();
 
       return (
@@ -76,7 +77,7 @@ class Laser extends PureComponent {
                     <RepeatButton
                       className="btn btn-default"
                       style={{ padding: 5 }}
-                      disabled={!canClick}
+                      disabled={!canOverride}
                       onClick={() => {
                         controller.command('spindleOverride', -10);
                       }}
@@ -89,7 +90,7 @@ class Laser extends PureComponent {
                     <RepeatButton
                       className="btn btn-default"
                       style={{ padding: 5 }}
-                      disabled={!canClick}
+                      disabled={!canOverride}
                       onClick={() => {
                         controller.command('spindleOverride', -1);
                       }}
@@ -102,7 +103,7 @@ class Laser extends PureComponent {
                     <RepeatButton
                       className="btn btn-default"
                       style={{ padding: 5 }}
-                      disabled={!canClick}
+                      disabled={!canOverride}
                       onClick={() => {
                         controller.command('spindleOverride', 1);
                       }}
@@ -115,7 +116,7 @@ class Laser extends PureComponent {
                     <RepeatButton
                       className="btn btn-default"
                       style={{ padding: 5 }}
-                      disabled={!canClick}
+                      disabled={!canOverride}
                       onClick={() => {
                         controller.command('spindleOverride', 10);
                       }}
@@ -130,7 +131,7 @@ class Laser extends PureComponent {
                       type="button"
                       className="btn btn-default"
                       style={{ padding: 5 }}
-                      disabled={!canClick}
+                      disabled={!canOverride}
                       onClick={() => {
                         controller.command('spindleOverride', 0);
                       }}
