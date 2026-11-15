@@ -290,6 +290,55 @@ describe('TinyGController', () => {
       expect(data(writes)[1]).toBe('{"mfo":1}\n');
     });
 
+    test('coalesced reset overrides earlier clicks and later clicks apply to 100 percent', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      [50, 0, 10].forEach(step => controller.command('spindleOverride', step));
+      controller.runner.parse('{"r":{"sso":1.8},"f":[3,0,12]}');
+      expect(data(writes)[1]).toBe('{"sso":1.1}\n');
+    });
+
+    test.each([1, 1.9])('job end may interleave with GET/SET; final spindle readback %s remains authoritative', finalFactor => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('spindleOverride', 10);
+      controller.runner.parse('{"r":{"sso":1.8},"f":[3,0,12]}');
+      expect(data(writes)[1]).toBe('{"sso":1.9}\n');
+      // Job end can happen while this absolute SET is in transit. Firmware may
+      // reset before accepting it (ends at1.9), or after accepting it (ends at1).
+      // There is no atomic relative-update primitive in this wire contract.
+      controller.runner.parse('{"sr":{"stat":4}}');
+      controller.runner.parse('{"r":{"sso":1.9},"f":[3,0,12]}');
+      expect(data(writes)[2]).toBe('{"sso":null,"ssc":null,"sse":null}\n');
+      controller.runner.parse(JSON.stringify({ r: { sso: finalFactor, ssc: finalFactor, sse: 1 }, f: [3, 0, 12] }));
+      expect(controller.runner.settings.sso).toBe(finalFactor);
+      expect(controller.overrideBusy).toBe(false);
+      expect(writes).toHaveLength(3);
+    });
+
+    test.each(['startup', 'driver error'])('%s between override GET and queued SET cancels the old intent', reason => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.transport.lineMode = true;
+      controller.transport.slots = 12;
+      controller.transport.enqueue('N1G1X1', { n: 1 });
+      controller.command('spindleOverride', 10);
+      controller.runner.parse('{"r":{"sso":1.8},"f":[3,0,1]}');
+      expect(controller.transport.pending.some(request => request.line === '{"sso":1.9}')).toBe(true);
+      if (reason === 'startup') {
+        controller.runner.parse('{"sr":{"fb":450.06,"msg":"SYSTEM READY"}}');
+      } else {
+        controller.connectionEventListener.error(new Error('driver failed after GET'));
+      }
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      controller.runner.parse('{"r":{"sso":1.8},"f":[3,0,12]}');
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.overridePending).toEqual({});
+      expect(controller.overrideBusy).toBe(false);
+      expect(writes).toHaveLength(2);
+      expect(data(writes)).not.toContain('{"sso":1.9}\n');
+    });
+
     test('reset discards pending override intent and credits', () => {
       const { controller } = setupController();
       controller.runner.settings.fb = 450.06;

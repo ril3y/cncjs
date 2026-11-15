@@ -1150,8 +1150,9 @@ class TinyGController {
         this.overridePending = {};
         this.overrideBusy = false;
       };
-      // Priority GET then SET closes the job-end/cache race, including spindle
-      // resets that have no ov event. Coalesce clicks arriving during the GET.
+      // Read before computing a step so the cache need not have seen a job-end
+      // reset. GET/SET is not atomic: firmware can end the job between them.
+      // Coalesce clicks during GET and read back the actual result after SET.
       this.transport.enqueue(JSON.stringify(fields), {
         priority: true,
         done: result => {
