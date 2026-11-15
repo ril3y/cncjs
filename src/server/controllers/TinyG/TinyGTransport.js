@@ -1,6 +1,6 @@
-// TinyG's line footer counts headers, not bytes. Keep each burst below the
-// UART ring size, and retire its byte allocation only when the entire burst
-// has replied (a control response may overtake an older data allocation).
+// Bound unread UART input, not the firmware's fragmented line-pool storage.
+// Every ordinary wire byte stays charged until its own matched reply proves the
+// line left the UART. This rolling window permits refill while older lines wait.
 export default class TinyGTransport {
   constructor(write, fault) {
     this.write = write;
@@ -26,8 +26,8 @@ export default class TinyGTransport {
 
   resume() {
     if (this.active.length || this.pending.length || this.failed) {
- return;
-}
+      return;
+    }
     this.suspended = false;
   }
 
@@ -35,8 +35,8 @@ export default class TinyGTransport {
     // Cancellation callbacks are notifications, not permission to start a new
     // transaction. Only the controller's verified resynchronization can resume.
     if (this.suspended) {
- return;
-}
+      return;
+    }
     line = String(line).trim();
     const bytes = Buffer.byteLength(line + '\n');
     // Include LF on the wire and leave room for the firmware's terminating NUL.
@@ -79,8 +79,8 @@ export default class TinyGTransport {
         if (this.paused && this.pending[0].n && this.pending[0].n > this.pauseThrough) {
           const controlIndex = this.pending.findIndex(request => !request.n);
           if (controlIndex < 0) {
- break;
-}
+            break;
+          }
           this.pending.unshift(...this.pending.splice(controlIndex, 1));
         }
         const request = this.pending[0];
@@ -106,7 +106,14 @@ export default class TinyGTransport {
         this.pending.shift();
         this.active.push(request);
         this.bytes += request.bytes;
-        this.write(request.line + '\n');
+        try {
+          this.write(request.line + '\n');
+        } catch (err) {
+          // A failed write may have partially reached the driver. Keep its debt
+          // and stop admission rather than treating it as an unsent request.
+          this.fail(`TinyG serial write failed: ${err.message}`);
+          break;
+        }
       }
     } finally {
       this.pumping = false;
@@ -142,14 +149,12 @@ export default class TinyGTransport {
     const generation = this.generation;
     const [request] = this.active.splice(index, 1);
     this.slots = data.f[0] === 3 ? Number(data.f[2]) : 0;
-    if (!this.active.length) {
-      this.bytes = 0;
-    }
+    this.bytes -= request.bytes;
     if (request.done) {
       request.done(data);
     }
     if (generation === this.generation) {
- this.pump();
-}
+      this.pump();
+    }
   }
 }

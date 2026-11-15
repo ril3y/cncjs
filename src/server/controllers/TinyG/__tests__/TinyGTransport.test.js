@@ -23,7 +23,7 @@ test('control replies never acknowledge numbered program requests', () => {
   expect(program).toHaveBeenCalledTimes(1);
 });
 
-test('bounds all controls and retains bytes until the data burst drains', () => {
+test('overtaking control replies release only their own UART bytes', () => {
   const { transport, write } = setup();
   transport.enqueue('N1G1X1', { n: 1 });
   for (let i = 0; i < 10; i++) {
@@ -32,7 +32,8 @@ test('bounds all controls and retains bytes until the data burst drains', () => 
   expect(write).toHaveBeenCalledTimes(2);
   const bytes = transport.bytes;
   transport.receive({ r: { mfo: 1.1 }, f: [3, 0, 10] });
-  expect(transport.bytes).toBeGreaterThan(bytes);
+  expect(transport.bytes).toBe(bytes); // next same-size control refills the released credit
+  expect(transport.active.some(request => request.n === 1)).toBe(true);
   expect(transport.active.filter(r => !r.n)).toHaveLength(1);
 });
 
@@ -136,4 +137,62 @@ test('a sole named control cannot be completed by a conflicting named reply', ()
   expect(done).not.toHaveBeenCalled();
   expect(transport.bytes).toBeGreaterThan(0);
   expect(fault).toHaveBeenCalledTimes(1);
+});
+
+test('refills on one program ACK without waiting for the remaining active lines', () => {
+  const { transport, write } = setup();
+  const line = n => 'N' + n + 'X'.repeat(37); // 40 wire bytes
+  for (let n = 1; n <= 4; n++) {
+ transport.enqueue(line(n), { n });
+}
+  expect(write).toHaveBeenCalledTimes(3);
+  expect(transport.bytes).toBe(120);
+  transport.receive({ r: { n: 1 }, f: [3, 0, 10] });
+  expect(write).toHaveBeenCalledTimes(4);
+  expect(transport.active.map(request => request.n)).toEqual([2, 3, 4]);
+  expect(transport.bytes).toBe(120);
+});
+
+test('rolling wire credit stays bounded during repeated control overtakes and declining headers', () => {
+  const { transport, write } = setup();
+  transport.enqueue('N1' + 'X'.repeat(117), { n: 1 }); // 120 bytes held outstanding
+  for (let i = 0; i < 8; i++) {
+ transport.enqueue('{mfo:1.1}');
+}
+  for (let slots = 10; slots >= 2; slots--) {
+    if (!transport.active.some(request => !request.n)) {
+ break;
+}
+    transport.receive({ r: { mfo: 1.1 }, f: [3, 0, slots] });
+    const sum = transport.active.reduce((total, request) => total + Buffer.byteLength(request.line + '\n'), 0);
+    expect(transport.bytes).toBe(sum);
+    expect(sum).toBeLessThanOrEqual(200);
+    expect(transport.active.some(request => request.n === 1)).toBe(true);
+  }
+  expect(write.mock.calls.length).toBeGreaterThan(2);
+  expect(transport.bytes).toBeGreaterThanOrEqual(120);
+});
+
+test('duplicate program reply cannot release rolling credit twice', () => {
+  const { transport, fault } = setup();
+  transport.enqueue('N1G1X1', { n: 1 });
+  transport.enqueue('N2G1X2', { n: 2 });
+  transport.receive({ r: { n: 1 }, f: [3, 0, 10] });
+  const bytes = transport.bytes;
+  transport.receive({ r: { n: 1 }, f: [3, 0, 10] });
+  expect(transport.bytes).toBe(bytes);
+  expect(fault).toHaveBeenCalledTimes(1);
+});
+
+test('write failure preserves uncertain byte debt and prevents further writes', () => {
+  const fault = jest.fn();
+  const write = jest.fn(() => {
+    throw new Error('driver failed');
+  });
+  const transport = new TinyGTransport(write, fault);
+  transport.enqueue('N1G1X1', { n: 1 });
+  expect(fault).toHaveBeenCalledTimes(1);
+  expect(transport.bytes).toBe(Buffer.byteLength('N1G1X1\n'));
+  transport.enqueue('N2G1X2', { n: 2 });
+  expect(write).toHaveBeenCalledTimes(1);
 });
