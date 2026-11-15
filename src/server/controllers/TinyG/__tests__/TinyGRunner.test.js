@@ -230,3 +230,31 @@ describe('TinyGRunner', () => {
     });
   });
 });
+
+test('real standalone startup frame updates identity and emits startup, never a reply', () => {
+  const runner = new TinyGRunner();
+  const startup = jest.fn();
+  const response = jest.fn();
+  const footer = jest.fn();
+  runner.on('startup', startup);
+  runner.on('response', response);
+  runner.on('f', footer);
+  runner.settings.mfo = 0.5;
+  runner.parse('{"sr":{"fv":0.97,"fb":450.06,"hp":1,"hv":8,"id":"fixture","msg":"SYSTEM READY"}}');
+  expect(startup).toHaveBeenCalledTimes(1);
+  expect(runner.settings.fb).toBe(450.06);
+  expect(runner.settings.mfo).toBe(1);
+  expect(runner.footer.rxBufferInfo).toBe(0);
+  expect(response).not.toHaveBeenCalled();
+  expect(footer).not.toHaveBeenCalled();
+});
+
+test('failed status and unknown override-event versions cannot overwrite confirmed factors', () => {
+  const runner = new TinyGRunner();
+  runner.settings.mfo = 0.8;
+  runner.parse('{"r":{"sr":{"mfo":1.5}},"f":[3,110,10]}');
+  expect(runner.settings.mfo).toBe(0.8);
+  runner.parse('{"ov":{"v":2,"mfo":1.6,"sso":1.8}}');
+  expect(runner.settings.mfo).toBe(0.8);
+  expect(runner.settings.sso).toBe(1);
+});

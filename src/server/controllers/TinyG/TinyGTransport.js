@@ -6,9 +6,12 @@ export default class TinyGTransport {
     this.write = write;
     this.fault = fault;
     this.reset();
+    this.suspended = false;
   }
 
   reset() {
+    this.suspended = true;
+    this.generation = (this.generation || 0) + 1;
     const requests = [...(this.pending || []), ...(this.active || [])];
     this.pending = [];
     this.active = [];
@@ -17,10 +20,23 @@ export default class TinyGTransport {
     this.lineMode = false;
     this.failed = false;
     this.paused = false;
+    this.pauseThrough = 0;
     requests.forEach((request) => request.done && request.done(null));
   }
 
+  resume() {
+    if (this.active.length || this.pending.length || this.failed) {
+ return;
+}
+    this.suspended = false;
+  }
+
   enqueue(line, options = {}) {
+    // Cancellation callbacks are notifications, not permission to start a new
+    // transaction. Only the controller's verified resynchronization can resume.
+    if (this.suspended) {
+ return;
+}
     line = String(line).trim();
     const bytes = Buffer.byteLength(line + '\n');
     // Include LF on the wire and leave room for the firmware's terminating NUL.
@@ -54,13 +70,13 @@ export default class TinyGTransport {
   }
 
   pump() {
-    if (this.pumping || this.failed) {
+    if (this.pumping || this.failed || this.suspended) {
       return;
     }
     this.pumping = true;
     try {
       while (this.pending.length) {
-        if (this.paused && this.pending[0].n) {
+        if (this.paused && this.pending[0].n && this.pending[0].n > this.pauseThrough) {
           const controlIndex = this.pending.findIndex(request => !request.n);
           if (controlIndex < 0) {
  break;
@@ -98,7 +114,7 @@ export default class TinyGTransport {
   }
 
   receive(data) {
-    if (!Array.isArray(data.f) || !this.active.length || this.failed) {
+    if (!Array.isArray(data.f) || !this.active.length || this.failed || this.suspended) {
       return;
     }
     const n = data.r && Number(data.r.n);
@@ -111,7 +127,7 @@ export default class TinyGTransport {
       if (
         control &&
         !n &&
-        (this.active.length === 1 ||
+        ((this.active.length === 1 && Object.keys(response).length === 0) ||
           Object.keys(response).includes((control.line.match(/^[{]\s*["']?([a-z0-9]+)["']?\s*:/i) || [])[1]))
       ) {
         index = this.active.indexOf(control);
@@ -123,6 +139,7 @@ export default class TinyGTransport {
       this.fail('Unmatched TinyG reply; reconnect before continuing');
       return;
     }
+    const generation = this.generation;
     const [request] = this.active.splice(index, 1);
     this.slots = data.f[0] === 3 ? Number(data.f[2]) : 0;
     if (!this.active.length) {
@@ -131,6 +148,8 @@ export default class TinyGTransport {
     if (request.done) {
       request.done(data);
     }
-    this.pump();
+    if (generation === this.generation) {
+ this.pump();
+}
   }
 }

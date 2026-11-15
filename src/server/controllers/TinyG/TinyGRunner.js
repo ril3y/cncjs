@@ -151,8 +151,30 @@ class TinyGRunner extends events.EventEmitter {
           data = {};
         }
 
-        const overrideValues = data.ov || (data.r && data.r.sr) || data.sr ||
-          ((data.f && data.f[1] === 0 && data.r) ? data.r : {});
+        // Startup messages are standalone status objects, never command replies.
+        const startup = data.sr;
+        if (startup && startup.msg === 'SYSTEM READY') {
+          this.settings = {
+            ...this.settings,
+            ..._.pick(startup, ['fb', 'fv', 'hp', 'hv', 'id']),
+            mfo: 1,
+            mfc: 1,
+            mfe: 1,
+            sso: 1,
+            ssc: 1,
+            sse: 1
+          };
+          this.footer = { revision: 0, statusCode: 0, rxBufferInfo: 0 };
+          this.emit('startup', startup);
+          return;
+        }
+
+        const successful = !data.f || data.f[1] === 0;
+        const feedEvent = data.ov && data.ov.v === 1 ? _.pick(data.ov, ['mfo', 'mfc', 'mfe']) : {};
+        let overrideValues = {};
+        if (successful) {
+          overrideValues = data.ov ? feedEvent : ((data.r && data.r.sr) || data.sr || data.r || {});
+        }
         const overrideKeys = ['mfo', 'mfc', 'mfe', 'sso', 'ssc', 'sse'];
         const updates = {};
         overrideKeys.forEach(key => {

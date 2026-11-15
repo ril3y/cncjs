@@ -85,3 +85,55 @@ test('an unrelated generic success cannot acknowledge even a sole program line',
   expect(done).not.toHaveBeenCalled();
   expect(fault).toHaveBeenCalledTimes(1);
 });
+
+test('reset suspends admission before cancellation callbacks and ignores late replies', () => {
+  const { transport, write } = setup();
+  const done = jest.fn(() => transport.enqueue('G1X2'));
+  transport.enqueue('G1X1', { done });
+  transport.reset();
+  expect(done).toHaveBeenCalledWith(null);
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(transport.active).toHaveLength(0);
+  expect(transport.pending).toHaveLength(0);
+  transport.enqueue('{sr:null}');
+  transport.receive({ r: {}, f: [3, 0, 12] });
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(transport.slots).toBe(0);
+});
+
+test('249-byte isolated line leaves no space for ordinary controls', () => {
+  const { transport, write } = setup();
+  transport.enqueue('N1' + 'X'.repeat(246), { n: 1 });
+  transport.enqueue('{sr:null}');
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(transport.bytes).toBe(249);
+  transport.receive({ r: { n: 1 }, f: [3, 0, 12] });
+  expect(write).toHaveBeenCalledTimes(2);
+});
+
+test('pause blocks queued program lines while allowing a bounded control request', () => {
+  const { transport, write } = setup();
+  transport.enqueue('N1' + 'X'.repeat(150), { n: 1 });
+  transport.enqueue('N2G1X2', { n: 2 });
+  expect(write).toHaveBeenCalledTimes(1);
+  transport.paused = true;
+  transport.enqueue('{sr:null}');
+  transport.receive({ r: { n: 1 }, f: [3, 0, 12] });
+  expect(write.mock.calls.flat()).not.toContain('N2G1X2\n');
+  expect(write.mock.calls.flat()).toContain('{sr:null}\n');
+  transport.receive({ r: { sr: {} }, f: [3, 0, 12] });
+  expect(write.mock.calls.flat()).not.toContain('N2G1X2\n');
+  transport.paused = false;
+  transport.pump();
+  expect(write.mock.calls.flat()).toContain('N2G1X2\n');
+});
+
+test('a sole named control cannot be completed by a conflicting named reply', () => {
+  const { transport, fault } = setup();
+  const done = jest.fn();
+  transport.enqueue('{fb:null}', { done });
+  transport.receive({ r: { mfo: 1 }, f: [3, 0, 10] });
+  expect(done).not.toHaveBeenCalled();
+  expect(transport.bytes).toBeGreaterThan(0);
+  expect(fault).toHaveBeenCalledTimes(1);
+});

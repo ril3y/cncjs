@@ -286,6 +286,34 @@ describe('TinyGController', () => {
       expect(controller.transport.failed).toBe(true);
     });
 
+    test.each(['M0', 'M1'])('ordered %s reaches the board before Resume and blocks later data', marker => {
+      const { controller, writes } = setupController();
+      controller.command('gcode:load', 'stop.nc', marker + '\nG1X1');
+      controller.command('gcode:start');
+      expect(data(writes)).toEqual(['N1' + marker + '\n']);
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      controller.command('gcode:resume');
+      expect(writes).toHaveLength(1); // never send ~ ahead of the marker
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
+      controller.command('gcode:resume');
+      expect(data(writes)[1]).toBe('~');
+      expect(data(writes)[2]).toBe('N2G1X1\n');
+    });
+
+    test('actual startup during a job cancels owners and requires reconnect without sending motion', () => {
+      const { controller, writes } = setupController();
+      controller.command('gcode:load', 'job.nc', 'G1X1\nG1X2');
+      controller.command('gcode:start');
+      controller.runner.parse('{"sr":{"fv":0.97,"fb":450.06,"hp":1,"hv":8,"id":"test","msg":"SYSTEM READY"}}');
+      expect(controller.ready).toBe(false);
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.transport.active).toHaveLength(0);
+      const count = writes.length;
+      controller.command('gcode', 'G1X123');
+      controller.command('gcode:start');
+      expect(writes).toHaveLength(count);
+    });
+
     describe('energizeMotors', () => {
       test('energizeMotors:on without a motor timeout writes nothing', () => {
         const { controller, writes } = setupController();
@@ -506,19 +534,23 @@ describe('TinyGController', () => {
     });
 
     test.each([
-      [undefined, ['!', '%', 'M30\n', '{"qr":""}\n']],
-      [100.04, ['\x04', 'M30\n', '{"qr":""}\n']],
-      [101.02, ['\x04', '{"qr":""}\n']],
+      [undefined, ['!', '%']],
+      [440.21, ['!', '%']],
+      [449.02, ['!', '%']],
+      [450.06, ['\x04']],
     ])('gcode:stop with force and firmware build %p kills the job accordingly', (fb, expected) => {
       const { controller, writes } = setupController();
 
       controller.command('gcode:load', 'test.nc', 'G21\nG90');
       if (fb !== undefined) {
-        controller.settings.fb = fb;
+        controller.runner.settings.fb = fb;
       }
       controller.command('gcode:stop', { force: true });
 
       drainFeeder(controller);
+      expect(data(writes)).toEqual(expected);
+      expect(controller.transport.suspended).toBe(true);
+      controller.command('gcode', 'G1X123');
       expect(data(writes)).toEqual(expected);
     });
 

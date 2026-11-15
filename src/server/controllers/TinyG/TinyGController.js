@@ -582,6 +582,10 @@ class TinyGController {
       });
       this.workflow.on('pause', (...args) => {
         this.transport.paused = true;
+        // The sender filter pauses before emitting an ordered stop marker. Let
+        // its predecessors and the marker reach the board; hold later lines.
+        const marker = args[0] && args[0].data;
+        this.transport.pauseThrough = ['M0', 'M1', 'M6'].includes(marker) ? this.sender.state.sent + 1 : 0;
         this.emit('workflow:state', this.workflow.state);
 
         if (args.length > 0) {
@@ -746,18 +750,19 @@ class TinyGController {
         }
       });
 
+      this.runner.on('startup', () => {
+        this.ready = false;
+        this.workflow.stop();
+        this.feeder.reset();
+        this.transport.reset();
+        this.overridePending = {};
+        this.overrideBusy = false;
+        this.lineMode = false;
+        // A banner alone does not establish that old host writes have drained.
+        this.emit('serialport:read', 'TinyG restarted; reconnect before continuing');
+      });
+
       this.runner.on('response', data => {
-        if (data.r && data.r.msg === 'SYSTEM READY') {
-          this.transport.reset();
-          this.overridePending = {};
-          this.overrideBusy = false;
-          this.lineMode = false;
-          this.runner.settings = { ...this.runner.settings, mfo: 1, sso: 1 };
-          if (!this.setup.running) {
-            this.initController();
-          }
-          return;
-        }
         if (data.f[1] === 100 && data.r) {
           Object.keys(data.r).forEach(key => {
             if (key in this.sr) {
@@ -1320,6 +1325,7 @@ class TinyGController {
 
         // Set ready flag to true
         this.ready = false;
+        this.transport.resume();
 
         // Initialize controller
         this.initController();
@@ -1517,23 +1523,16 @@ class TinyGController {
           const [options] = args;
           const { force = false } = { ...options };
           if (force) {
-            const firmwareBuild = ensureNumber(_.get(this.settings, 'fb'));
-
-            if (firmwareBuild >= 101) {
-              // https://github.com/synthetos/g2/releases/tag/101.02
-              // * Added explicit Job Kill ^d - has the effect of an M30 (program end)
-              this.writeln('\x04'); // kill job (^d)
-            } else if (firmwareBuild >= 100) {
-              this.writeln('\x04'); // kill job (^d)
-              this.writeln('M30'); // end of program
+            const firmwareBuild = Number(this.runner.settings.fb);
+            if (firmwareBuild >= 450.01) {
+              this.write('\x04'); // TinyG job kill; does not produce a startup banner
             } else {
-              // https://github.com/synthetos/g2/wiki/Feedhold,-Resume,-and-Other-Simple-Commands#jogging-using-feedhold-and-queue-flush
-              // Send a ! to stop movement immediately.
-              // Send a % to flush remaining moves from planner buffer.
-              this.writeln('!'); // feedhold
-              this.writeln('%'); // queue flush
-              this.writeln('M30'); // end of program
+              this.write('!');
+              this.write('%');
             }
+            // Discarding input invalidates reply ownership. Reconnect is required
+            // before any new ordinary traffic; do not append M30 or a GET here.
+            return;
           }
 
           this.writeln('{"qr":""}'); // queue report
@@ -1554,6 +1553,12 @@ class TinyGController {
           this.command('gcode:resume');
         },
         'gcode:resume': () => {
+          const barrier = this.transport.pauseThrough;
+          if (barrier && [...this.transport.active, ...this.transport.pending].some(request => request.n && request.n <= barrier)) {
+            this.emit('serialport:read', 'Waiting for the program stop marker before resuming');
+            return;
+          }
+          this.transport.pauseThrough = 0;
           this.event.trigger('gcode:resume');
 
           this.writeln('~'); // cycle start
@@ -2069,13 +2074,18 @@ class TinyGController {
         source: WRITE_SOURCE_CLIENT
       });
       if (realtime) {
-        if (data.trim() === '\x18' || data.trim() === '\x04') {
+        if (['\x18', '\x04', '%'].includes(data.trim())) {
+          this.workflow.stop();
+          this.feeder.reset();
           this.overridePending = {};
           this.overrideBusy = false;
           this.transport.reset();
           this.lineMode = false;
           this.ready = false;
-          this.runner.settings = { ...this.runner.settings, mfo: 1, sso: 1 };
+          if (data.trim() !== '%') {
+ this.runner.settings = { ...this.runner.settings, mfo: 1, sso: 1 };
+}
+          this.emit('serialport:read', 'TinyG input was discarded; reconnect before continuing');
         }
         this.connection.write(data.trim());
         return;
