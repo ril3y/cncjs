@@ -127,6 +127,8 @@ class TinyGController {
 
     recovery = null;
 
+    transactionId = randomBytes(4).readUInt32BE(0);
+
     observationOnly = false;
 
     setupGeneration = 0;
@@ -481,6 +483,9 @@ class TinyGController {
           // M1 Program Pause
           if (words.find(isM1)) {
             log.debug(`M1 Program Pause: line=${x(originalLine)}, sent=${sent}, received=${received}`);
+
+            // Preserve cncjs's host-pause policy even if firmware os disables M1.
+            // The modern resume fence drains motion without requiring stat=STOP.
 
             this.event.trigger('gcode:pause');
             this.workflow.pause({
@@ -1700,15 +1705,27 @@ class TinyGController {
           }, 10 * 60 * 1000);
           // M400 on 450.01+ replies only after planner, runtime and prepared
           // segments drain. A marker ACK alone only proves that it was parsed.
-          this.transport.enqueue(modern ? 'M400' : '{qr:null,stat:null}', {
+          const tid = Number(this.runner.settings.fb) >= 450.02 ? this.nextTransactionId() : undefined;
+          let command = modern ? 'M400' : '{qr:null,stat:null}';
+          if (tid !== undefined) {
+            command = JSON.stringify({ tid, gc: 'M400' });
+          }
+          this.emit('serialport:read', 'Waiting for prior motion to finish; a manual feed hold must not be mistaken for the program stop');
+          this.transport.enqueue(command, {
             priority: true,
             fence: true,
+            tid,
+            replyGC: 'M400',
             done: response => {
               clearTimeout(timer);
               this.stopProbePending = false;
               this.transport.fencing = false;
-              if (!response || response.f[1] || epoch !== this.programEpoch ||
+              if (!response || epoch !== this.programEpoch ||
                   !this.workflow.isPaused() || this.transport.pauseThrough !== barrier) {
+                return;
+              }
+              if (response.f[1]) {
+                this.failRecovery(`TinyG program-pause fence failed (${response.f[1]}); explicit Reset recovery is required`);
                 return;
               }
               if (!modern && (plannerCapacity <= 0 ||
@@ -2236,6 +2253,11 @@ class TinyGController {
       this.emit('serialport:read', message);
     }
 
+    nextTransactionId() {
+      this.transactionId = (this.transactionId + 1) % 0x100000000;
+      return this.transactionId;
+    }
+
     beginResetRecovery() {
       if (this.recovery) {
         clearTimeout(this.recovery.timer);
@@ -2258,7 +2280,7 @@ class TinyGController {
         );
         return;
       }
-      const recovery = { tid: randomBytes(4).readUInt32BE(0), drained: false, banner: false, probed: false };
+      const recovery = { tid: this.nextTransactionId(), drained: false, banner: false, probed: false };
       this.recovery = recovery;
       recovery.timer = setTimeout(() => {
         if (this.recovery === recovery) {

@@ -229,3 +229,13 @@ test('execution fence waits for every prior owner and blocks all later ordinary 
   transport.receive({ r: { gc: 'M400' }, f: [3, 0, 12] });
   expect(write.mock.calls.flat()).toContain('G1X2\n');
 });
+
+test.each([{ tid: 40, gc: 'M400' }, { tid: 41, gc: 'G1X1' }, { gc: 'M400' }])('tagged fence rejects stale or conflicting completion %j', reply => {
+  const { transport, fault } = setup();
+  const done = jest.fn();
+  transport.enqueue('{"tid":41,"gc":"M400"}', { tid: 41, replyGC: 'M400', fence: true, done });
+  transport.receive({ tid: reply.tid, r: { gc: reply.gc }, f: [3, 0, 12] });
+  expect(done).not.toHaveBeenCalled();
+  expect(fault).toHaveBeenCalledTimes(1);
+  expect(transport.bytes).toBeGreaterThan(0);
+});

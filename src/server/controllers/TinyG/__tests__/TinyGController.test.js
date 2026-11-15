@@ -63,6 +63,12 @@ const setupController = (configOverrides = {}) => {
 
 const data = (writes) => writes.map((entry) => entry.data);
 
+const answerFence = (controller, writes, status = 0) => {
+  const request = JSON.parse(data(writes).filter(line => line.includes('M400')).pop());
+  controller.runner.parse(JSON.stringify({ tid: request.tid, r: { gc: 'M400' }, f: [3, status, 12] }));
+  return request.tid;
+};
+
 const sourceOf = (events, text) => events
   .filter((entry) => entry.event === 'serialport:write' && entry.args[0] === text)
   .map((entry) => entry.args[1].source);
@@ -372,8 +378,8 @@ describe('TinyGController', () => {
       expect(writes).toHaveLength(1); // never send ~ ahead of the marker
       controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
       controller.command('gcode:resume');
-      expect(data(writes)[1]).toBe('M400\n');
-      controller.runner.parse('{"r":{"gc":"M400"},"f":[3,0,12]}');
+      expect(JSON.parse(data(writes)[1])).toMatchObject({ gc: 'M400' });
+      answerFence(controller, writes);
       expect(data(writes)[2]).toBe('~');
       expect(data(writes)[3]).toBe('N2G1X1\n');
     });
@@ -389,12 +395,93 @@ describe('TinyGController', () => {
       controller.command('gcode:resume');
       expect(data(writes)).not.toContain('~');
       expect(data(writes)).not.toContain('N3G1X0\n');
-      expect(data(writes).pop()).toBe('M400\n');
+      expect(JSON.parse(data(writes).pop())).toMatchObject({ gc: 'M400' });
       // M1 disabled / host-ignored M6 need not report STOP, but the deferred
       // fence still waits for the final prepared/running segment to complete.
-      controller.runner.parse('{"r":{"gc":"M400"},"f":[3,0,12]}');
+      answerFence(controller, writes);
       expect(data(writes)).toContain('~');
       expect(data(writes)).toContain('N3G1X0\n');
+    });
+
+    test.each([0, 1])('modern M1 with firmware os=%s retains explicit host pause until the fence completes', os => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'optional.nc', 'M1\nG1X1');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      controller.runner.parse(JSON.stringify({ sr: { stat: os ? 3 : 1 } }));
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      controller.command('gcode:resume');
+      expect(data(writes)).not.toContain('~');
+      answerFence(controller, writes);
+      expect(data(writes)).toContain('~');
+    });
+
+    test('450.01 uses its deferred raw M400 fence without assuming tagged support', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.01;
+      controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
+      controller.command('gcode:resume');
+      expect(data(writes)[1]).toBe('M400\n');
+      controller.runner.parse('{"r":{"gc":"M400"},"f":[2,0,250]}');
+      expect(data(writes)).toContain('~');
+    });
+
+    test('manual hold before a marker cannot force cycle start to complete its fence', () => {
+      const { controller, writes, events } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'hold.nc', 'G1X100\nM0\nG1X0');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      controller.runner.parse('{"r":{"n":2},"f":[3,0,12]}');
+      controller.runner.parse('{"sr":{"stat":6}}');
+      controller.command('gcode:resume');
+      controller.command('gcode:resume');
+      controller.runner.parse('{"sr":{"stat":6,"qr":31}}');
+      expect(data(writes)).not.toContain('~');
+      expect(data(writes).filter(line => line.includes('M400'))).toHaveLength(1);
+      expect(events.some(entry => entry.event === 'serialport:read' && entry.args[0].includes('manual feed hold'))).toBe(true);
+    });
+
+    test.each(['alarm', 'startup'])('%s during an execution fence cannot release pending MDI motion', reason => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      controller.command('gcode:resume');
+      const tid = JSON.parse(data(writes)[1]).tid;
+      controller.write('G1X999\n');
+      expect(controller.transport.pending).toHaveLength(1);
+      if (reason === 'alarm') {
+        answerFence(controller, writes, 204);
+      } else {
+        controller.runner.parse('{"sr":{"fb":450.06,"msg":"SYSTEM READY"}}');
+      }
+      controller.runner.parse(JSON.stringify({ tid, r: { gc: 'M400' }, f: [3, 0, 12] }));
+      expect(controller.transport.suspended).toBe(true);
+      expect(data(writes)).not.toContain('~');
+      expect(data(writes)).not.toContain('G1X999\n');
+    });
+
+    test('repeated program pauses use distinct fence transaction IDs', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'stops.nc', 'M0\nG1X1\nM0\nG1X2');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      controller.command('gcode:resume');
+      const first = answerFence(controller, writes);
+      controller.runner.parse('{"r":{"n":2},"f":[3,0,12]}');
+      controller.runner.parse('{"r":{"qr":32},"f":[3,0,12]}');
+      controller.runner.parse('{"r":{"n":3},"f":[3,0,12]}');
+      controller.command('gcode:resume');
+      const second = answerFence(controller, writes);
+      expect(second).not.toBe(first);
+      expect(data(writes).filter(line => line === '~')).toHaveLength(2);
+      expect(data(writes)).toContain('N4G1X2\n');
     });
 
     test('legacy M0 requires a fresh fully freed planner and STOP after its ACK', () => {

@@ -142,14 +142,16 @@ export default class TinyGTransport {
       const controls = this.active.filter((r) => !r.n);
       const response = data.r || {};
       const control = controls[0];
+      const tagged = control && Number.isInteger(control.tid);
       if (
         control &&
-        ((control.kind === 'gcode' && response.gc === control.line) ||
+        ((tagged && data.tid === control.tid && response.gc === control.replyGC) ||
+          (!tagged && ((control.kind === 'gcode' && response.gc === control.line) ||
           (!n && ((this.active.length === 1 && Object.keys(response).length === 0) ||
-            (control.kind === 'json' && Object.keys(response).includes(control.key)))))
+            (control.kind === 'json' && Object.keys(response).includes(control.key)))))))
       ) {
         index = this.active.indexOf(control);
-      } else if (this.active.length === 1 && !n && data.f[1] && Object.keys(response).length === 0) {
+      } else if (!tagged && this.active.length === 1 && !n && data.f[1] && Object.keys(response).length === 0) {
         index = 0;
       }
     }
