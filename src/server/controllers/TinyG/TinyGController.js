@@ -778,7 +778,7 @@ class TinyGController {
             return;
           }
           if (data.f[1] !== 0 || !Number.isFinite(_.get(data, 'r.fb')) || Number(_.get(data, 'r.fb')) < 450.02 ||
-              ![1, 3, 4].includes(_.get(data, 'r.sr.stat'))) {
+              ![1, 3, 4].includes(_.get(data, 'r.stat'))) {
             this.failRecovery('TinyG recovery probe did not confirm an idle board');
             return;
           }
@@ -952,8 +952,8 @@ class TinyGController {
         if (!Number.isFinite(_.get(lastResponse, 'r.fb')) || lastResponse.r.fb <= 0) {
           throw new Error('TinyG did not return firmware identity; attachment remains observation-only');
         }
-        await send('{sr:n}');
-        if (![1, 3, 4].includes(_.get(lastResponse, 'r.sr.stat'))) {
+        await send('{stat:n}');
+        if (![1, 3, 4].includes(_.get(lastResponse, 'r.stat'))) {
           this.setup.rejected = true;
           this.emit('serialport:read', 'TinyG must be idle before setup; attachment is observation-only');
           return;
@@ -1064,13 +1064,21 @@ class TinyGController {
           this.emit('serialport:read', 'TinyG is in ALARM: the settings will be applied after the alarm is cleared');
         }
 
-        this.ready = !this.setup.rejected;
-        this.observationOnly = !this.ready;
         if (reapply) {
+          if (generation !== this.setupGeneration || this.isClose() || this.transport.suspended ||
+              this.transport.failed || recoveryRequired.has(this.options.port)) {
+            return;
+          }
+          this.ready = !this.setup.rejected;
+          this.observationOnly = !this.ready;
           return;
         }
 
         await delay(50);
+        if (generation !== this.setupGeneration || this.isClose() || this.transport.suspended ||
+            this.transport.failed || recoveryRequired.has(this.options.port)) {
+          return;
+        }
         this.ready = !this.setup.rejected;
         this.observationOnly = !this.ready;
         this.event.trigger('controller:ready');
@@ -2219,7 +2227,7 @@ class TinyGController {
       // One bounded read-only probe, after the ordered reset. Neither a stale
       // banner nor an old untagged reply can complete it. Adapter ordering still
       // needs hardware qualification; timeout never releases normal admission.
-      this.connection.write(JSON.stringify({ tid: recovery.tid, fb: null, sr: null }) + '\n');
+      this.connection.write(JSON.stringify({ tid: recovery.tid, fb: null, stat: null }) + '\n');
     }
 
     write(data, context) {

@@ -55,7 +55,12 @@ export default class TinyGTransport {
       }
       return;
     }
-    const request = { ...options, line, bytes };
+    const key = (line.match(/^[{]\s*["']?([a-z0-9]+)["']?\s*:/i) || [])[1];
+    let kind = key ? 'json' : 'gcode';
+    if (options.n) {
+      kind = 'program';
+    }
+    const request = { ...options, line, bytes, kind, key };
     if (options.priority) {
       this.pending.unshift(request);
     } else {
@@ -125,7 +130,8 @@ export default class TinyGTransport {
       return;
     }
     const n = data.r && Number(data.r.n);
-    let index = this.active.findIndex((r) => r.n && r.n === n);
+    let index = this.active.findIndex((r) => r.n && r.n === n &&
+      (!data.r.gc || data.r.gc === r.line));
     if (index < 0) {
       // Never guess ownership of a footer-only error with multiple requests.
       const controls = this.active.filter((r) => !r.n);
@@ -133,9 +139,9 @@ export default class TinyGTransport {
       const control = controls[0];
       if (
         control &&
-        !n &&
-        ((this.active.length === 1 && Object.keys(response).length === 0) ||
-          Object.keys(response).includes((control.line.match(/^[{]\s*["']?([a-z0-9]+)["']?\s*:/i) || [])[1]))
+        ((control.kind === 'gcode' && response.gc === control.line) ||
+          (!n && ((this.active.length === 1 && Object.keys(response).length === 0) ||
+            (control.kind === 'json' && Object.keys(response).includes(control.key)))))
       ) {
         index = this.active.indexOf(control);
       } else if (this.active.length === 1 && !n && data.f[1] && Object.keys(response).length === 0) {

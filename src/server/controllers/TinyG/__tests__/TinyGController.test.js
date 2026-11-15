@@ -143,7 +143,7 @@ const respondToWrites = (controller, writes, reply) => {
 };
 
 const setupCommands = [
-  '{fb:n}', '{sr:n}', '{ej:1}', '{jv:5}', '{ex:0}', '{qv:1}', '{sv:1}', '{si:200}',
+  '{fb:n}', '{stat:n}', '{ej:1}', '{jv:5}', '{ex:0}', '{qv:1}', '{sv:1}', '{si:200}',
   '{spe:n}', '{spd:n}', '{spc:n}', '{sps:n}', '{com:n}', '{cof:n}',
   expect.stringMatching(/^{sr:{stat:t,/),
   '{sys:n}', '{mt:n}', '{pwr:n}', '{qr:n}', '{sr:n}',
@@ -996,7 +996,7 @@ describe('TinyGController', () => {
         if (line === '{fb:n}') {
           return '{"r":{"fb":440.21},"f":[1,0,5]}';
         }
-        return line === '{sr:n}' ? '{"r":{"sr":{"stat":1}},"f":[1,0,5]}' : '{"r":{},"f":[1,0,5]}';
+        return line === '{stat:n}' ? '{"r":{"stat":1},"f":[1,0,5]}' : '{"r":{},"f":[1,0,5]}';
       });
 
       await controller.initController();
@@ -1014,7 +1014,7 @@ describe('TinyGController', () => {
         if (line === '{spe:n}') {
           return null;
         }
-        return line === '{sr:n}' ? '{"r":{"sr":{"stat":1}},"f":[1,0,5]}' : '{"r":{},"f":[1,0,5]}';
+        return line === '{stat:n}' ? '{"r":{"stat":1},"f":[1,0,5]}' : '{"r":{},"f":[1,0,5]}';
       });
 
       await controller.initController();
@@ -1029,8 +1029,8 @@ describe('TinyGController', () => {
       if (line === '{fb:n}') {
         return '{"r":{"fb":440.21},"f":[1,0,5]}';
       }
-      if (line === '{sr:n}') {
-        return `{"r":{"sr":{"stat":${board.stat}}},"f":[1,0,6]}`;
+      if (line === '{stat:n}') {
+        return `{"r":{"stat":${board.stat}},"f":[1,0,6]}`;
       }
       const isSet = !/:n}$/.test(line);
       return `{"r":{},"f":[1,${(isSet && board.stat === 2) ? 204 : 0},5]}`;
@@ -1073,7 +1073,7 @@ describe('TinyGController', () => {
         if (line === '{fb:n}') {
           return '{"r":{"fb":449.02},"f":[1,0,5]}';
         }
-        return line === '{sr:n}' ? '{"r":{"sr":{"stat":2}},"f":[1,0,6]}' : '{"r":{},"f":[1,0,5]}';
+        return line === '{stat:n}' ? '{"r":{"stat":2},"f":[1,0,6]}' : '{"r":{},"f":[1,0,5]}';
       });
 
       await controller.initController();
@@ -1095,13 +1095,34 @@ describe('TinyGController', () => {
   });
 
   describe('recovery and state-preserving attachment', () => {
+    test('startup during the final setup delay cannot restore readiness', async () => {
+      const { controller, writes } = setupController();
+      const trigger = jest.spyOn(controller.event, 'trigger');
+      respondToWrites(controller, writes, line => {
+        if (line === '{fb:n}') {
+          return '{"r":{"fb":440.21},"f":[2,0,250]}';
+        }
+        if (line === '{stat:n}') {
+          return '{"r":{"stat":1},"f":[2,0,250]}';
+        }
+        if (line === '{sr:n}') {
+          setTimeout(() => controller.runner.parse('{"sr":{"fb":440.21,"msg":"SYSTEM READY"}}'), 10);
+        }
+        return '{"r":{},"f":[2,0,250]}';
+      });
+      await controller.initController();
+      expect(controller.ready).toBe(false);
+      expect(controller.observationOnly).toBe(true);
+      expect(trigger).not.toHaveBeenCalledWith('controller:ready');
+    });
+
     test.each([5, 6])('running/held state %s receives only read-only discovery', async stat => {
       const { controller, writes } = setupController();
       respondToWrites(controller, writes, line => (line === '{fb:n}'
         ? '{"r":{"fb":450.06},"f":[3,0,12]}'
-        : JSON.stringify({ r: { sr: { stat } }, f: [3, 0, 12] })));
+        : JSON.stringify({ r: { stat }, f: [3, 0, 12] })));
       await controller.initController();
-      expect(data(writes)).toEqual(['{fb:n}\n', '{sr:n}\n']);
+      expect(data(writes)).toEqual(['{fb:n}\n', '{stat:n}\n']);
       expect(controller.ready).toBe(false);
       controller.command('gcode', 'G1X9');
       controller.write('G1X9\n');
@@ -1136,11 +1157,11 @@ describe('TinyGController', () => {
       expect(writes).toHaveLength(2);
       drains.shift()(null);
       const probe = JSON.parse(data(writes)[2]);
-      expect(probe).toMatchObject({ fb: null, sr: null });
-      controller.runner.parse(JSON.stringify({ tid: probe.tid + 1, r: { fb: 450.06, sr: { stat: 1 } }, f: [3, 0, 12] }));
+      expect(probe).toMatchObject({ fb: null, stat: null });
+      controller.runner.parse(JSON.stringify({ tid: probe.tid + 1, r: { fb: 450.06, stat: 1 }, f: [3, 0, 12] }));
       expect(init).not.toHaveBeenCalled();
       expect(controller.transport.suspended).toBe(true);
-      controller.runner.parse(JSON.stringify({ tid: probe.tid, r: { fb: 450.06, sr: { stat: 1 } }, f: [3, 0, 12] }));
+      controller.runner.parse(JSON.stringify({ tid: probe.tid, r: { fb: 450.06, stat: 1 }, f: [3, 0, 12] }));
       expect(init).toHaveBeenCalledTimes(1);
       expect(controller.transport.suspended).toBe(false);
     });
@@ -1167,8 +1188,8 @@ describe('TinyGController', () => {
         if (line === '{rx:n}') {
           return `{"r":{"rx":${board.free}},"f":${footer()}}`;
         }
-        if (line === '{sr:n}') {
-          return `{"r":{"sr":{"stat":1}},"f":${footer()}}`;
+        if (line === '{stat:n}') {
+          return `{"r":{"stat":1},"f":${footer()}}`;
         }
         return `{"r":{},"f":${footer()}}`;
       };

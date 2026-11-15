@@ -139,6 +139,25 @@ test('a sole named control cannot be completed by a conflicting named reply', ()
   expect(fault).toHaveBeenCalledTimes(1);
 });
 
+test.each([{}, { n: 87 }])('verbose MDI echo owns its reply despite cached n: %j', extra => {
+  const { transport, fault } = setup();
+  const done = jest.fn();
+  transport.enqueue('G1X2', { done });
+  transport.receive({ r: { ...extra, gc: 'G1X2' }, f: [3, 0, 12] });
+  expect(done).toHaveBeenCalledTimes(1);
+  expect(fault).not.toHaveBeenCalled();
+  expect(transport.bytes).toBe(0);
+});
+
+test('wrong MDI echo cannot complete the active request', () => {
+  const { transport, fault } = setup();
+  const done = jest.fn();
+  transport.enqueue('G1X2', { done });
+  transport.receive({ r: { gc: 'G1X1' }, f: [3, 0, 12] });
+  expect(done).not.toHaveBeenCalled();
+  expect(fault).toHaveBeenCalledTimes(1);
+});
+
 test('refills on one program ACK without waiting for the remaining active lines', () => {
   const { transport, write } = setup();
   const line = n => 'N' + n + 'X'.repeat(37); // 40 wire bytes
