@@ -69,6 +69,26 @@ const answerFence = (controller, writes, status = 0) => {
   return request.tid;
 };
 
+const contextQueries = [
+  '{"stat":null,"posx":null,"posy":null,"posz":null,"posa":null,"posb":null,"posc":null}',
+  '{"stat":null,"mpox":null,"mpoy":null,"mpoz":null,"mpoa":null,"mpob":null,"mpoc":null}',
+  '{"stat":null,"unit":null,"coor":null,"momo":null,"plan":null,"path":null,"dist":null,"frmo":null,"tool":null,"spc":null,"com":null,"cof":null}'
+];
+const contextValues = (controller, values = {}) => ({
+  stat: 1, posx: 0, posy: 0, posz: 0, posa: 0, posb: 0, posc: 0,
+  mpox: 0, mpoy: 0, mpoz: 0, mpoa: 0, mpob: 0, mpoc: 0,
+  unit: controller.runner.getModalGroup().units === 'G20' ? 0 : 1,
+  coor: 1, momo: 0, plan: 0, path: 0, dist: 0, frmo: 0, tool: 0,
+  spc: 0, com: 0, cof: 0, ...values
+});
+const answerContext = (controller, values = {}) => {
+  contextQueries.forEach(query => {
+    const snapshot = contextValues(controller, values);
+    const r = Object.fromEntries(Object.keys(JSON.parse(query)).map(key => [key, snapshot[key]]));
+    controller.runner.parse(JSON.stringify({ r, f: [3, 0, 12] }));
+  });
+};
+
 const sourceOf = (events, text) => events
   .filter((entry) => entry.event === 'serialport:write' && entry.args[0] === text)
   .map((entry) => entry.args[1].source);
@@ -86,8 +106,9 @@ const drainFeeder = (controller) => {
       let r = request.n ? { n: request.n } : {};
       if (request.replyGC || request.line === 'M400') {
         r = { gc: 'M400' };
-      } else if (request.line === '{sr:null}') {
-        r = { sr: { stat: 1 } };
+      } else if (contextQueries.includes(request.line) || request.line === '{"stat":null}') {
+        const snapshot = contextValues(controller);
+        r = Object.fromEntries(Object.keys(JSON.parse(request.line)).map(key => [key, snapshot[key]]));
       }
       controller.runner.parse(JSON.stringify({ tid: request.tid, r, f: [2, 0, 250] }));
     } else {
@@ -165,7 +186,7 @@ const setupCommands = [
 
 const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) => [
   'FENCE',
-  '{sr:null}',
+  ...contextQueries,
   'G4 P0.5',
   'M5',
   'G90',
@@ -186,7 +207,7 @@ const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) =
   'G0 Z0',
   'M5',
   'G4 P5',
-].flatMap(line => line === 'M0' ? [line, 'FENCE', '{sr:null}'] : [line])
+].flatMap(line => line === 'M0' ? [line, 'FENCE', '{"stat":null}'] : [line])
   .map(line => line === 'FENCE' ? expect.stringMatching(/^\{"tid":\d+,"gc":"M400"\}\n$/) : line + '\n');
 
 describe('TinyGController', () => {
@@ -928,6 +949,106 @@ describe('TinyGController', () => {
   });
 
   describe('tool:change', () => {
+    test('standalone preparation explicitly reads context even when saved sr contains only stat', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.runner.parse('{"sr":{"stat":1}}');
+      seedModal(controller, { units: 'G20', spindle: 'M5', wcs: 'G54' });
+      controller.command('tool:change');
+      controller.command('tool:change');
+      expect(writes).toHaveLength(1);
+      answerFence(controller, writes);
+      expect(controller.feeder.size()).toBe(0);
+      answerContext(controller, { posx: 42, unit: 1, coor: 2, spc: 1, tool: 7 });
+      expect(data(writes).slice(1, 4)).toEqual(contextQueries.map(query => query + '\n'));
+      expect(controller.populateContext({})).toMatchObject({ posx: 42, tool: 7, modal: { units: 'G21', wcs: 'G55', spindle: 'M3' } });
+      drainFeeder(controller);
+      expect(data(writes)).toContain('G0 X42 Y0\n');
+      expect(data(writes)).toContain('M3\n');
+    });
+
+    test.each([0, 1, 2])('missing required field in context group %i refuses standalone macro dispatch', group => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('tool:change');
+      answerFence(controller, writes);
+      for (let index = 0; index <= group; index++) {
+        const keys = Object.keys(JSON.parse(contextQueries[index]));
+        const snapshot = contextValues(controller);
+        const r = Object.fromEntries(keys.map(key => [key, snapshot[key]]));
+        if (index === group) {
+          delete r[keys[keys.length - 1]];
+        }
+        controller.runner.parse(JSON.stringify({ r, f: [3, 0, 12] }));
+      }
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.feeder.size()).toBe(0);
+      expect(data(writes)).not.toContain('G4 P0.5\n');
+    });
+
+    test('standalone tool change refuses a running program', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'motion.nc', 'G1X100\nG1X0');
+      controller.command('gcode:start');
+      const before = writes.length;
+      controller.command('tool:change');
+      expect(writes).toHaveLength(before);
+      expect(controller.toolChangePreparing).toBe(false);
+      expect(controller.feeder.size()).toBe(0);
+    });
+
+    test('standalone tool phase holds direct motion and refuses unrelated feeder commands', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('tool:change');
+      controller.write('G1X999\n');
+      controller.command('gcode', 'G1X888');
+      answerFence(controller, writes);
+      answerContext(controller);
+      controller.command('gcode', 'G1X777');
+      expect(data(writes)).not.toContain('G1X999\n');
+      expect(controller.transport.motionBlocked).toBe(true);
+      drainFeeder(controller);
+      const lines = data(writes);
+      expect(lines.indexOf('G1X999\n')).toBeGreaterThan(lines.indexOf('G4 P5\n'));
+      expect(lines).not.toContain('G1X888\n');
+      expect(lines).not.toContain('G1X777\n');
+      expect(controller.toolChangeActive).toBe(false);
+      expect(controller.transport.motionBlocked).toBe(false);
+    });
+
+    test('feeder stop cancels standalone preparation before any macro dispatch', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('tool:change');
+      answerFence(controller, writes);
+      controller.command('feeder:stop');
+      const before = writes.length;
+      answerContext(controller);
+      expect(writes).toHaveLength(before);
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.feeder.size()).toBe(0);
+    });
+
+    test.each(['stop', 'error'])('%s during explicit context reads cancels all preparation callbacks', reason => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('tool:change');
+      answerFence(controller, writes);
+      if (reason === 'stop') {
+        controller.command('gcode:stop', { force: true });
+      } else {
+        controller.connectionEventListener.error(new Error('driver failed during context read'));
+      }
+      const before = writes.length;
+      answerContext(controller, { posx: 42 });
+      expect(writes).toHaveLength(before);
+      expect(controller.toolChangePreparing).toBe(false);
+      expect(controller.toolChangeActive).toBe(false);
+      expect(controller.feeder.size()).toBe(0);
+    });
+
     test('modern M6 waits for the long predecessor and fresh position before dispatching a macro', () => {
       const { controller, writes } = setupController({
         'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS,
@@ -945,10 +1066,10 @@ describe('TinyGController', () => {
       controller.command('feeder:start');
       expect(writes).toHaveLength(3); // only the fence; no macro, cycle start or N3
       answerFence(controller, writes);
-      expect(data(writes)[3]).toBe('{sr:null}\n');
+      expect(data(writes)[3]).toBe(contextQueries[0] + '\n');
       expect(controller.feeder.size()).toBe(0);
-      controller.runner.parse('{"r":{"sr":{"stat":3,"posx":100,"posy":0,"posz":0}},"f":[3,0,12]}');
-      expect(data(writes).slice(4)).toEqual(['~', 'G4 P0.5\n']);
+      answerContext(controller, { stat: 3, posx: 100 });
+      expect(data(writes).slice(6)).toEqual(['~', 'G4 P0.5\n']);
       controller.command('gcode:resume');
       expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
       drainFeeder(controller);
@@ -961,14 +1082,14 @@ describe('TinyGController', () => {
       const { controller, writes } = setupController();
       controller.runner.settings.fb = 450.06;
       controller.toolChangeActive = true;
-      controller.command('gcode', ['M0', 'G1X2']);
+      controller.command('gcode', ['M0', 'G1X2'], { [controller.toolChangeOwner]: true });
       controller.command('feeder:start');
       expect(data(writes)).toEqual(['M0\n']);
       controller.runner.parse('{"r":{"gc":"M0"},"f":[3,0,12]}');
       controller.command('feeder:start');
       expect(data(writes)).not.toContain('~');
       answerFence(controller, writes);
-      controller.runner.parse('{"r":{"sr":{"stat":3}},"f":[3,0,12]}');
+      controller.runner.parse('{"r":{"stat":3},"f":[3,0,12]}');
       controller.command('feeder:start');
       expect(data(writes)).toContain('~');
       controller.runner.parse('{"r":{"qr":32},"f":[3,0,12]}');

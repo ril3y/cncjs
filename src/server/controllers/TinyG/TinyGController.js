@@ -72,6 +72,14 @@ const recoveryRequired = new Set();
 // An observed qr maximum during attachment is not proof of an empty planner.
 const legacyPlannerCapacity = (build) => ([440.21, 449.02].includes(build) ? 32 : 0);
 
+// Explicit flat getters do not depend on the user's persisted sr selection.
+// Keep each group small enough for both the wire limit and firmware JSON output.
+const TOOL_CONTEXT_GROUPS = [
+  ['stat', 'posx', 'posy', 'posz', 'posa', 'posb', 'posc'],
+  ['stat', 'mpox', 'mpoy', 'mpoz', 'mpoa', 'mpob', 'mpoc'],
+  ['stat', 'unit', 'coor', 'momo', 'plan', 'path', 'dist', 'frmo', 'tool', 'spc', 'com', 'cof']
+];
+
 class TinyGController {
     type = TINYG;
 
@@ -130,6 +138,8 @@ class TinyGController {
     toolChangePreparing = false;
 
     toolChangeActive = false;
+
+    toolChangeOwner = Symbol('TinyG tool-change macro');
 
     auxFencePending = false;
 
@@ -421,12 +431,13 @@ class TinyGController {
           source: WRITE_SOURCE_FEEDER
         });
 
-        const toolStop = this.toolChangeActive && /^M0$/i.test(line);
+        const toolMacro = this.toolChangeActive && context[this.toolChangeOwner] === true;
+        const toolStop = toolMacro && /^M0$/i.test(line);
         if (toolStop) {
           this.feederStopPending = true;
         }
         this.transport.enqueue(line, {
-          allowPaused: this.toolChangeActive,
+          allowPaused: toolMacro,
           done: response => {
             if (!response) {
               return;
@@ -442,8 +453,11 @@ class TinyGController {
               return;
             }
             this.feeder.next();
-            if (!this.feeder.size() && !this.feeder.isPending()) {
+            if (toolMacro && !this.feeder.size() && !this.feeder.isPending() &&
+                !this.transport.active.some(request => request.allowPaused) &&
+                !this.transport.pending.some(request => request.allowPaused)) {
               this.toolChangeActive = false;
+              this.transport.motionBlocked = false;
             }
           }
         });
@@ -1267,7 +1281,7 @@ class TinyGController {
         if (!response || epoch !== this.programEpoch || generation !== this.setupGeneration) {
           return;
         }
-        if (response.f[1] || (requireStatus && ![1, 3, 4].includes(_.get(response, 'r.sr.stat')))) {
+        if (response.f[1] || (requireStatus && ![1, 3, 4].includes(_.get(response, 'r.stat')))) {
           this.failRecovery('TinyG tool-change fence did not confirm idle motion; explicit Reset recovery is required');
           return;
         }
@@ -1283,13 +1297,37 @@ class TinyGController {
             finish(response);
             return;
           }
-          // Capture coordinates only after the runtime fence and a fresh report,
-          // not from the periodic report that may predate the final segment.
-          this.transport.enqueue('{sr:null}', {
-            priority: true,
-            fence: true,
-            done: report => finish(report, true)
-          });
+          const groups = readStatus === 'context' ? TOOL_CONTEXT_GROUPS : [['stat']];
+          const snapshot = {};
+          const readGroup = index => {
+            const keys = groups[index];
+            this.transport.enqueue(JSON.stringify(_.fromPairs(keys.map(key => [key, null]))), {
+              priority: true,
+              fence: true,
+              done: report => {
+                if (!report || epoch !== this.programEpoch || generation !== this.setupGeneration || report.f[1]) {
+                  finish(report);
+                  return;
+                }
+                if (!keys.every(key => Number.isFinite(_.get(report, ['r', key]))) ||
+                    ![1, 3, 4].includes(report.r.stat)) {
+                  clearTimeout(timer);
+                  this.failRecovery('TinyG tool-change context is incomplete or not idle; explicit Reset recovery is required');
+                  return;
+                }
+                Object.assign(snapshot, _.pick(report.r, keys));
+                if (index + 1 < groups.length) {
+                  readGroup(index + 1);
+                  return;
+                }
+                // Reuse status-field decoding for these validated, owned getter
+                // results. No footer is supplied, so this creates no reply credit.
+                this.runner.parse(JSON.stringify({ sr: snapshot }));
+                finish({ r: snapshot, f: report.f }, true);
+              }
+            });
+          };
+          readGroup(0);
         }
       });
       return true;
@@ -1315,6 +1353,7 @@ class TinyGController {
       const touchPlateHeight = mapValueToUnits(config.get('tool.touchPlateHeight', 0), units);
 
       const context = {
+        [this.toolChangeOwner]: true,
         'tool_change_x': toolChangeX,
         'tool_change_y': toolChangeY,
         'tool_change_z': toolChangeZ,
@@ -1432,7 +1471,7 @@ class TinyGController {
       const modal = this.runner.getModalGroup();
 
       // Tool
-      const tool = this.runner.getTool();
+      const tool = _.get(this.runner.state, 'sr.tool', this.runner.getTool());
 
       return Object.assign(context || {}, {
         // User-defined global variables
@@ -1969,6 +2008,10 @@ class TinyGController {
           this.feeder.next();
         },
         'feeder:stop': () => {
+          if (this.toolChangePreparing || this.toolChangeActive) {
+            this.failRecovery('TinyG tool-change cancelled; explicit Reset recovery is required');
+            return;
+          }
           this.feeder.reset();
         },
         'feedhold': () => {
@@ -2072,7 +2115,11 @@ class TinyGController {
           this.command('gcode', commands);
         },
         'gcode': () => {
-          const [commands, context] = args;
+          const [commands, context = {}] = args;
+          if ((this.toolChangePreparing || this.toolChangeActive) && context[this.toolChangeOwner] !== true) {
+            this.emit('serialport:read', 'Complete or cancel the tool change before sending other G-code');
+            return;
+          }
           const data = ensureArray(commands)
             .join('\n')
             .split(/\r?\n/)
@@ -2159,6 +2206,7 @@ class TinyGController {
             return;
           }
           this.toolChangePreparing = true;
+          this.transport.motionBlocked = true;
           if (!this.runMotionFence(() => {
             this.toolChangePreparing = false;
             this.toolChangeActive = true;
@@ -2168,8 +2216,9 @@ class TinyGController {
               this.writeln('~');
             }
             this.dispatchToolChange();
-          }, true)) {
+          }, 'context')) {
             this.toolChangePreparing = false;
+            this.transport.motionBlocked = false;
           }
         },
         'autolevel:start': () => {

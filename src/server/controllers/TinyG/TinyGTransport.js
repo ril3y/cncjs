@@ -25,6 +25,7 @@ export default class TinyGTransport {
     this.paused = false;
     this.pauseThrough = 0;
     this.fencing = false;
+    this.motionBlocked = false;
     requests.forEach((request) => request.done && request.done(null));
   }
 
@@ -86,16 +87,16 @@ export default class TinyGTransport {
     try {
       while (this.pending.length) {
         const held = request => {
-          if (!this.paused || request.fence || request.allowPaused) {
+          if (request.fence || request.allowPaused || (!this.paused && !this.motionBlocked)) {
             return false;
           }
           if (request.n) {
-            return request.n > this.pauseThrough;
+            return this.motionBlocked || request.n > this.pauseThrough;
           }
           // After an ordered program stop, do not queue MDI/macro motion behind
           // M0 before its execution fence. Only non-motion controls may overtake.
           // Validate the entire group: a safe first key must not hide gc/home.
-          return this.pauseThrough > 0 && !PAUSED_CONTROL_LINE.test(request.line);
+          return (this.motionBlocked || this.pauseThrough > 0) && !PAUSED_CONTROL_LINE.test(request.line);
         };
         if (held(this.pending[0])) {
           const controlIndex = this.pending.findIndex(request => !held(request));
