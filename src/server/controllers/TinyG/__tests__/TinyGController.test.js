@@ -903,6 +903,32 @@ describe('TinyGController', () => {
   });
 
   describe('tool:change', () => {
+    test.each([440.21, 449.02])('legacy %s automatic M6 never dispatches a macro before Resume', fb => {
+      const { controller, writes, events } = setupController({
+        'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS,
+      });
+      controller.runner.settings.fb = fb;
+      controller.command('gcode:load', 'legacy-tool.nc', 'G1X100\nM6\nG1X0');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[2,0,250]}');
+      expect(data(writes)).toEqual(['N1G1X100\n', 'N2M0\n']);
+      expect(controller.feeder.size()).toBe(0);
+      expect(controller.toolChangeBlocked).toBe(true);
+      controller.runner.parse('{"r":{"n":2},"f":[2,0,250]}');
+      controller.command('gcode:resume');
+      expect(writes).toHaveLength(2);
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      expect(events.some(entry => entry.event === 'serialport:read' && entry.args[0].includes('tool-change macros'))).toBe(true);
+    });
+
+    test('direct legacy tool-change command emits no macro or motion', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 449.02;
+      controller.command('tool:change');
+      expect(writes).toHaveLength(0);
+      expect(controller.feeder.size()).toBe(0);
+    });
+
     const metricPins = {
       'tool.toolChangeX': 0,
       'tool.toolChangeY': 0,
@@ -924,6 +950,7 @@ describe('TinyGController', () => {
         ...metricPins,
         'tool.toolChangePolicy': policy,
       });
+      controller.runner.settings.fb = 450.06;
       seedModal(controller, { spindle: 'M5', wcs: 'G54' });
 
       controller.command('tool:change');
@@ -943,6 +970,7 @@ describe('TinyGController', () => {
         ...metricPins,
         'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS,
       });
+      controller.runner.settings.fb = 450.06;
       seedModal(controller, { spindle: 'M5', wcs: 'G54' });
 
       controller.command('tool:change');
@@ -962,6 +990,7 @@ describe('TinyGController', () => {
         ...metricPins,
         'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_TLO,
       });
+      controller.runner.settings.fb = 450.06;
       seedModal(controller, { spindle: 'M5', wcs: 'G54' });
 
       controller.command('tool:change');
@@ -982,6 +1011,7 @@ describe('TinyGController', () => {
         'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_CUSTOM_PROBING,
         'tool.toolProbeCustomCommands': 'G38.2 Z-5 F25\nG92 Z0',
       });
+      controller.runner.settings.fb = 450.06;
       seedModal(controller, { spindle: 'M5', wcs: 'G54' });
 
       controller.command('tool:change');
@@ -1010,6 +1040,7 @@ describe('TinyGController', () => {
         'tool.toolProbeFeedrate': 254,
         'tool.touchPlateHeight': 25.4,
       });
+      controller.runner.settings.fb = 450.06;
       seedModal(controller, { spindle: 'M5', wcs: 'G54', units: 'G20' });
 
       controller.command('tool:change');

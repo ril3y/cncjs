@@ -123,6 +123,8 @@ class TinyGController {
 
     overrideBusy = false;
 
+    toolChangeBlocked = false;
+
     programEpoch = 0;
 
     recovery = null;
@@ -593,6 +595,7 @@ class TinyGController {
       // Workflow
       this.workflow = new Workflow();
       this.workflow.on('start', (...args) => {
+        this.toolChangeBlocked = false;
         this.transport.paused = false;
         this.emit('workflow:state', this.workflow.state);
         this.blocked = false;
@@ -600,6 +603,7 @@ class TinyGController {
         this.sender.rewind();
       });
       this.workflow.on('stop', (...args) => {
+        this.toolChangeBlocked = false;
         this.programEpoch++;
         this.transport.paused = true;
         this.transport.pending = this.transport.pending.filter(request => !request.n);
@@ -1672,6 +1676,10 @@ class TinyGController {
           this.command('gcode:resume');
         },
         'gcode:resume': () => {
+          if (this.toolChangeBlocked) {
+            this.emit('serialport:read', 'This job requires unsupported legacy tool-change automation; stop and select manual M6 handling or update the firmware');
+            return;
+          }
           const barrier = this.transport.pauseThrough;
           if (barrier && [...this.transport.active, ...this.transport.pending].some(request => request.n && request.n <= barrier)) {
             this.emit('serialport:read', 'Waiting for the program stop marker before resuming');
@@ -1925,6 +1933,14 @@ class TinyGController {
           });
         },
         'tool:change': () => {
+          if (!(Number(this.runner.settings.fb) >= 450.01)) {
+            // A legacy queued M0 can establish a stop, but the existing macro's
+            // %wait does not prove that runtime motion ended before it captures
+            // coordinates or dispatches tool/probe moves. Do not start that path.
+            this.toolChangeBlocked = true;
+            this.emit('serialport:read', 'Automatic tool-change macros require newer TinyG firmware; select manual M6 handling or update before starting the job');
+            return;
+          }
           const modal = this.runner.getModalGroup();
           const units = {
             'G20': IMPERIAL_UNITS,
