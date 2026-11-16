@@ -750,6 +750,8 @@ describe('TinyGController', () => {
       expect(data(writes)).toContain('~');
       expect(data(writes).indexOf('G1X999\n')).toBeGreaterThan(data(writes).indexOf('~'));
       expect(controller.feederStop).toBe(null);
+      resumeAll();
+      expect(data(writes).filter(line => line === '~')).toHaveLength(1);
     });
 
     test.each(['feeder:start', 'cyclestart', 'raw'])('%s cannot bypass a numbered program stop', resumePath => {
@@ -770,6 +772,11 @@ describe('TinyGController', () => {
       expect(data(writes).filter(line => line.includes('M400'))).toHaveLength(1);
       answerFence(controller, writes);
       expect(data(writes)).toContain('~');
+      controller.command('gcode:resume');
+      controller.command('feeder:start');
+      controller.command('cyclestart');
+      controller.write('~');
+      expect(data(writes).filter(line => line === '~')).toHaveLength(1);
     });
 
     test.each([440.21, 449.02])('legacy %s ordinary feeder stop refuses unsupported resume', fb => {
@@ -820,6 +827,55 @@ describe('TinyGController', () => {
       expect(writes).toHaveLength(before);
       expect(controller.transport.suspended).toBe(true);
       expect(controller.feederStop).toBe(null);
+    });
+
+    test.each(['command', 'status'])('a new manual hold from %s permits one new cycle start', source => {
+      const { controller, writes } = setupController();
+      controller.command('cyclestart');
+      controller.command('cyclestart');
+      expect(data(writes).filter(line => line === '~')).toHaveLength(1);
+      if (source === 'command') {
+        controller.command('feedhold');
+      } else {
+        controller.runner.parse('{"sr":{"stat":6}}');
+      }
+      controller.command('cyclestart');
+      controller.command('cyclestart');
+      expect(data(writes).filter(line => line === '~')).toHaveLength(2);
+    });
+
+    test.each([
+      ['feeder', 'gcode:load'], ['feeder', 'gcode:unload'],
+      ['program', 'gcode:load'], ['program', 'gcode:unload'],
+      ['tool', 'gcode:load'], ['tool', 'gcode:unload']
+    ])('%s stop callbacks cannot survive %s replacement', (owner, replacement) => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      if (owner === 'program') {
+        controller.command('gcode:load', 'old.nc', 'M0\nG1X2');
+        controller.command('gcode:start');
+        controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+        controller.command('gcode:resume');
+      } else if (owner === 'feeder') {
+        controller.command('gcode', ['M0', 'G1X2']);
+        controller.runner.parse('{"r":{"gc":"M0"},"f":[3,0,12]}');
+      } else {
+        controller.command('tool:change');
+      }
+      const tid = JSON.parse(data(writes).filter(line => line.includes('M400')).pop()).tid;
+      controller.command(replacement, 'replacement.nc', 'G1X999');
+      const before = writes.length;
+      controller.runner.parse(JSON.stringify({ tid, r: { gc: 'M400' }, f: [3, 0, 12] }));
+      answerContext(controller);
+      controller.command('gcode:start');
+      controller.command('gcode:resume');
+      controller.command('feeder:start');
+      controller.command('cyclestart');
+      expect(writes).toHaveLength(before);
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.feederStop).toBe(null);
+      expect(controller.toolChangeActive).toBe(false);
+      expect(controller.toolChangePreparing).toBe(false);
     });
 
     test('feeder:stop clears the queue without writing', () => {

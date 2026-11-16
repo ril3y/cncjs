@@ -149,6 +149,8 @@ class TinyGController {
 
     cycleStartOwner = Symbol('TinyG verified cycle start');
 
+    cycleStartIssued = false;
+
     programEpoch = 0;
 
     recovery = null;
@@ -694,6 +696,7 @@ class TinyGController {
         this.sender.rewind();
       });
       this.workflow.on('pause', (...args) => {
+        this.cycleStartIssued = false;
         this.transport.paused = true;
         // The sender filter pauses before emitting an ordered stop marker. Let
         // its predecessors and the marker reach the board; hold later lines.
@@ -902,6 +905,9 @@ class TinyGController {
       });
 
       this.runner.on('sr', (sr) => {
+        if (sr.stat === 6) {
+          this.cycleStartIssued = false;
+        }
         // The board has left the ALARM state that rejected the connect-time setup
         if (!recoveryRequired.has(this.options.port) && this.setup.rejected && !this.setup.running && this.runner.isIdle()) {
           log.debug('The alarm has been cleared: applying the controller setup again');
@@ -1292,6 +1298,7 @@ class TinyGController {
         this.feederStop = { kind, awaitingLine: true, ready: false };
       }
       this.feederStopPending = true;
+      this.cycleStartIssued = false;
       this.transport.motionBlocked = true;
     }
 
@@ -1859,6 +1866,10 @@ class TinyGController {
             callback = context;
             context = {};
           }
+          if (this.feederStop || this.transport.pauseThrough || this.toolChangePreparing ||
+              this.toolChangeActive || this.auxFencePending || this.stopProbePending) {
+            this.failRecovery('TinyG job replaced during a stop or tool change; explicit Reset recovery is required');
+          }
 
           // G4 P0 or P with a very small value will empty the planner queue and then
           // respond with an ok when the dwell is complete. At that instant, there will
@@ -1881,6 +1892,10 @@ class TinyGController {
           callback(null, this.sender.toJSON());
         },
         'gcode:unload': () => {
+          if (this.feederStop || this.transport.pauseThrough || this.toolChangePreparing ||
+              this.toolChangeActive || this.auxFencePending || this.stopProbePending) {
+            this.failRecovery('TinyG job unloaded during a stop or tool change; explicit Reset recovery is required');
+          }
           this.workflow.stop();
 
           // Sender
@@ -1951,6 +1966,9 @@ class TinyGController {
           this.command('gcode:resume');
         },
         'gcode:resume': () => {
+          if (!this.workflow.isPaused()) {
+            return;
+          }
           if (this.pendingToolChange || this.toolChangePreparing || this.toolChangeActive) {
             this.emit('serialport:read', 'Complete the tool-change preparation and feeder prompts before resuming the program');
             return;
@@ -2033,6 +2051,9 @@ class TinyGController {
           this.command('gcode', commands, context);
         },
         'feeder:start': () => {
+          if (this.cycleStartIssued) {
+            return;
+          }
           if (this.transport.pauseThrough && !this.toolChangeActive) {
             this.emit('serialport:read', 'Use program Resume to complete the pending program-stop fence');
             return;
@@ -2069,6 +2090,9 @@ class TinyGController {
           this.writeln('{"qr":""}'); // queue report
         },
         'cyclestart': () => {
+          if (this.cycleStartIssued) {
+            return;
+          }
           if (this.feederStop) {
             this.command('feeder:start');
             return;
@@ -2487,6 +2511,7 @@ class TinyGController {
       this.auxFencePending = false;
       this.feederStopPending = false;
       this.feederStop = null;
+      this.cycleStartIssued = false;
       this.setup.running = false;
       this.observationOnly = true;
       recoveryRequired.add(this.options.port);
@@ -2585,6 +2610,12 @@ class TinyGController {
         log.error(`Serial port "${this.options.port}" is not accessible`);
         return;
       }
+      if (String(data).trim() === '!') {
+        this.cycleStartIssued = false;
+      }
+      if (String(data).trim() === '~' && this.cycleStartIssued) {
+        return;
+      }
 
       if (String(data).trim() === '~' && (this.transport.suspended || this.transport.failed)) {
         this.emit('serialport:read', 'TinyG cycle start requires successful recovery first');
@@ -2608,6 +2639,9 @@ class TinyGController {
         source: WRITE_SOURCE_CLIENT
       });
       if (realtime) {
+        if (data.trim() === '~') {
+          this.cycleStartIssued = true;
+        }
         if (data.trim() === '\x18') {
           this.beginResetRecovery();
           return;
