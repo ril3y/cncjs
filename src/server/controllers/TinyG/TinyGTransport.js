@@ -1,6 +1,9 @@
 // Bound unread UART input, not the firmware's fragmented line-pool storage.
 // Every ordinary wire byte stays charged until its own matched reply proves the
 // line left the UART. This rolling window permits refill while older lines wait.
+const PAUSED_CONTROL_FIELD = '["\']?(?:mfo|mfc|mfe|sso|ssc|sse|sr|stat|qr|rx|mt|pwr|clear)["\']?\\s*:\\s*(?:null|true|false|""|-?\\d+(?:\\.\\d+)?)';
+const PAUSED_CONTROL_LINE = new RegExp(`^\\{\\s*${PAUSED_CONTROL_FIELD}(?:\\s*,\\s*${PAUSED_CONTROL_FIELD})*\\s*\\}$`, 'i');
+
 export default class TinyGTransport {
   constructor(write, fault) {
     this.write = write;
@@ -82,8 +85,20 @@ export default class TinyGTransport {
     this.pumping = true;
     try {
       while (this.pending.length) {
-        if (this.paused && this.pending[0].n && this.pending[0].n > this.pauseThrough) {
-          const controlIndex = this.pending.findIndex(request => !request.n);
+        const held = request => {
+          if (!this.paused || request.fence || request.allowPaused) {
+            return false;
+          }
+          if (request.n) {
+            return request.n > this.pauseThrough;
+          }
+          // After an ordered program stop, do not queue MDI/macro motion behind
+          // M0 before its execution fence. Only non-motion controls may overtake.
+          // Validate the entire group: a safe first key must not hide gc/home.
+          return this.pauseThrough > 0 && !PAUSED_CONTROL_LINE.test(request.line);
+        };
+        if (held(this.pending[0])) {
+          const controlIndex = this.pending.findIndex(request => !held(request));
           if (controlIndex < 0) {
             break;
           }

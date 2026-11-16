@@ -125,6 +125,16 @@ class TinyGController {
 
     toolChangeBlocked = false;
 
+    pendingToolChange = false;
+
+    toolChangePreparing = false;
+
+    toolChangeActive = false;
+
+    auxFencePending = false;
+
+    feederStopPending = false;
+
     programEpoch = 0;
 
     recovery = null;
@@ -411,11 +421,32 @@ class TinyGController {
           source: WRITE_SOURCE_FEEDER
         });
 
-        this.transport.enqueue(line, { done: response => {
-          if (response) {
+        const toolStop = this.toolChangeActive && /^M0$/i.test(line);
+        if (toolStop) {
+          this.feederStopPending = true;
+        }
+        this.transport.enqueue(line, {
+          allowPaused: this.toolChangeActive,
+          done: response => {
+            if (!response) {
+              return;
+            }
+            if (this.toolChangeActive && response.f[1]) {
+              this.failRecovery(`TinyG tool-change command failed (${response.f[1]})`);
+              return;
+            }
+            if (toolStop) {
+              this.runMotionFence(() => {
+                this.feederStopPending = false;
+              }, true);
+              return;
+            }
             this.feeder.next();
+            if (!this.feeder.size() && !this.feeder.isPending()) {
+              this.toolChangeActive = false;
+            }
           }
-} });
+        });
         log.silly(`> ${line}`);
       });
       this.feeder.on('hold', noop);
@@ -534,7 +565,11 @@ class TinyGController {
                 msg: this.messageSlot.take() ?? originalLine,
               });
 
-              this.command('tool:change');
+              if (Number(this.runner.settings.fb) >= 450.01) {
+                this.pendingToolChange = true;
+              } else {
+                this.command('tool:change');
+              }
             }
           }
 
@@ -576,6 +611,9 @@ class TinyGController {
             if (response.f[1] && !config.get('state.controller.exception.ignoreErrors')) {
               this.emit('serialport:read', `> ${this.sender.state.lines[n - 1].trim()} (ln=${n + 1})`);
               this.workflow.pause({ err: true, msg: `TinyG error ${response.f[1]} at N${n}` });
+            } else if (this.pendingToolChange && n === this.transport.pauseThrough) {
+              this.pendingToolChange = false;
+              this.command('tool:change');
             } else if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
               this.sender.next();
             }
@@ -597,6 +635,7 @@ class TinyGController {
       this.workflow.on('start', (...args) => {
         this.toolChangeBlocked = false;
         this.transport.paused = false;
+        this.transport.pauseThrough = 0;
         this.emit('workflow:state', this.workflow.state);
         this.blocked = false;
         this.senderStatus = SENDER_STATUS_NONE;
@@ -604,8 +643,13 @@ class TinyGController {
       });
       this.workflow.on('stop', (...args) => {
         this.toolChangeBlocked = false;
+        this.pendingToolChange = false;
+        this.toolChangePreparing = false;
+        this.toolChangeActive = false;
+        this.feederStopPending = false;
         this.programEpoch++;
         this.transport.paused = true;
+        this.transport.pauseThrough = 0;
         this.transport.pending = this.transport.pending.filter(request => !request.n);
         this.emit('workflow:state', this.workflow.state);
         this.blocked = false;
@@ -1204,6 +1248,165 @@ class TinyGController {
       });
     }
 
+    runMotionFence(done, readStatus = false) {
+      if (this.auxFencePending || this.transport.fencing || this.transport.suspended || this.transport.failed) {
+        return false;
+      }
+      const epoch = this.programEpoch;
+      const generation = this.setupGeneration;
+      const tid = Number(this.runner.settings.fb) >= 450.02 ? this.nextTransactionId() : undefined;
+      this.auxFencePending = true;
+      this.transport.fencing = true;
+      const timer = setTimeout(() => {
+        this.failRecovery('TinyG tool-change fence timed out; explicit Reset recovery is required');
+      }, 10 * 60 * 1000);
+      const finish = (response, requireStatus = false) => {
+        clearTimeout(timer);
+        this.auxFencePending = false;
+        this.transport.fencing = false;
+        if (!response || epoch !== this.programEpoch || generation !== this.setupGeneration) {
+          return;
+        }
+        if (response.f[1] || (requireStatus && ![1, 3, 4].includes(_.get(response, 'r.sr.stat')))) {
+          this.failRecovery('TinyG tool-change fence did not confirm idle motion; explicit Reset recovery is required');
+          return;
+        }
+        done();
+      };
+      this.transport.enqueue(tid === undefined ? 'M400' : JSON.stringify({ tid, gc: 'M400' }), {
+        priority: true,
+        fence: true,
+        tid,
+        replyGC: 'M400',
+        done: response => {
+          if (!response || response.f[1] || epoch !== this.programEpoch || generation !== this.setupGeneration || !readStatus) {
+            finish(response);
+            return;
+          }
+          // Capture coordinates only after the runtime fence and a fresh report,
+          // not from the periodic report that may predate the final segment.
+          this.transport.enqueue('{sr:null}', {
+            priority: true,
+            fence: true,
+            done: report => finish(report, true)
+          });
+        }
+      });
+      return true;
+    }
+
+    dispatchToolChange() {
+      const modal = this.runner.getModalGroup();
+      const units = {
+        'G20': IMPERIAL_UNITS,
+        'G21': METRIC_UNITS,
+      }[modal.units];
+      const toolChangePolicy = config.get('tool.toolChangePolicy', TOOL_CHANGE_POLICY_IGNORE_M6_COMMANDS);
+      const toolChangeX = mapPositionToUnits(config.get('tool.toolChangeX', 0), units);
+      const toolChangeY = mapPositionToUnits(config.get('tool.toolChangeY', 0), units);
+      const toolChangeZ = mapPositionToUnits(config.get('tool.toolChangeZ', 0), units);
+      const toolProbeX = mapPositionToUnits(config.get('tool.toolProbeX', 0), units);
+      const toolProbeY = mapPositionToUnits(config.get('tool.toolProbeY', 0), units);
+      const toolProbeZ = mapPositionToUnits(config.get('tool.toolProbeZ', 0), units);
+      const toolProbeCustomCommands = ensureString(config.get('tool.toolProbeCustomCommands')).split('\n');
+      const toolProbeCommand = config.get('tool.toolProbeCommand', 'G38.2');
+      const toolProbeDistance = mapValueToUnits(config.get('tool.toolProbeDistance', 1), units);
+      const toolProbeFeedrate = mapValueToUnits(config.get('tool.toolProbeFeedrate', 10), units);
+      const touchPlateHeight = mapValueToUnits(config.get('tool.touchPlateHeight', 0), units);
+
+      const context = {
+        'tool_change_x': toolChangeX,
+        'tool_change_y': toolChangeY,
+        'tool_change_z': toolChangeZ,
+        'tool_probe_x': toolProbeX,
+        'tool_probe_y': toolProbeY,
+        'tool_probe_z': toolProbeZ,
+        'tool_probe_command': toolProbeCommand,
+        'tool_probe_distance': toolProbeDistance,
+        'tool_probe_feedrate': toolProbeFeedrate,
+        'touch_plate_height': touchPlateHeight,
+
+        // internal functions
+        'mapWCSToPValue': function (wcs) {
+          return {
+            'G54': 1,
+            'G55': 2,
+            'G56': 3,
+            'G57': 4,
+            'G58': 5,
+            'G59': 6,
+          }[wcs] || 0;
+        },
+      };
+
+      const lines = [];
+
+      // Wait until the planner queue is empty
+      lines.push('%wait');
+
+      // Remember original position and spindle state
+      lines.push('%_posx=posx');
+      lines.push('%_posy=posy');
+      lines.push('%_posz=posz');
+      lines.push('%_modal_spindle=modal.spindle');
+
+      // Stop the spindle
+      lines.push('M5');
+
+      // Absolute positioning
+      lines.push('G90');
+
+      // Move to the tool change position
+      lines.push('G53 G0 Z[tool_change_z]');
+      lines.push('G53 G0 X[tool_change_x] Y[tool_change_y]');
+      lines.push('%wait');
+
+      // Prompt the user to change the tool
+      lines.push('%msg Tool Change T[tool]');
+      lines.push('M0');
+
+      // Move to the tool probe position
+      lines.push('G53 G0 X[tool_probe_x] Y[tool_probe_y]');
+      lines.push('G53 G0 Z[tool_probe_z]');
+      lines.push('%wait');
+
+      if (toolChangePolicy === TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS) {
+        // Probe the tool
+        lines.push('G91 [tool_probe_command] F[tool_probe_feedrate] Z[tool_probe_z - mposz - tool_probe_distance]');
+        // Set coordinate system offset
+        lines.push('G10 L20 P[mapWCSToPValue(modal.wcs)] Z[touch_plate_height]');
+      } else if (toolChangePolicy === TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_TLO) {
+        // Probe the tool
+        lines.push('G91 [tool_probe_command] F[tool_probe_feedrate] Z[tool_probe_z - mposz - tool_probe_distance]');
+        // Pause for 1 second
+        lines.push('%wait 1');
+        // Set tool length offset
+        lines.push('{tofz:[posz - touch_plate_height]}');
+      } else if (toolChangePolicy === TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_CUSTOM_PROBING) {
+        lines.push(...toolProbeCustomCommands);
+      }
+
+      // Move to the tool change position
+      lines.push('G53 G0 Z[tool_change_z]');
+      lines.push('G53 G0 X[tool_change_x] Y[tool_change_y]');
+      lines.push('%wait');
+
+      // Prompt the user to restart the spindle
+      lines.push('%msg Restart Spindle');
+      lines.push('M0');
+
+      // Restore the position and spindle state
+      lines.push('G90');
+      lines.push('G0 X[_posx] Y[_posy]');
+      lines.push('G0 Z[_posz]');
+      lines.push('[_modal_spindle]');
+
+      // Wait 5 seconds for the spindle to speed up
+      lines.push('%wait 5');
+
+      this.command('gcode', lines, context);
+    }
+
     populateContext(context) {
       // Machine position
       const {
@@ -1676,6 +1879,10 @@ class TinyGController {
           this.command('gcode:resume');
         },
         'gcode:resume': () => {
+          if (this.pendingToolChange || this.toolChangePreparing || this.toolChangeActive) {
+            this.emit('serialport:read', 'Complete the tool-change preparation and feeder prompts before resuming the program');
+            return;
+          }
           if (this.toolChangeBlocked) {
             this.emit('serialport:read', 'This job requires unsupported legacy tool-change automation; stop and select manual M6 handling or update the firmware');
             return;
@@ -1750,6 +1957,9 @@ class TinyGController {
           this.command('gcode', commands, context);
         },
         'feeder:start': () => {
+          if (this.toolChangePreparing || this.auxFencePending || this.feederStopPending) {
+            return;
+          }
           if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
             return;
           }
@@ -1941,115 +2151,26 @@ class TinyGController {
             this.emit('serialport:read', 'Automatic tool-change macros require newer TinyG firmware; select manual M6 handling or update before starting the job');
             return;
           }
-          const modal = this.runner.getModalGroup();
-          const units = {
-            'G20': IMPERIAL_UNITS,
-            'G21': METRIC_UNITS,
-          }[modal.units];
-          const toolChangePolicy = config.get('tool.toolChangePolicy', TOOL_CHANGE_POLICY_IGNORE_M6_COMMANDS);
-          const toolChangeX = mapPositionToUnits(config.get('tool.toolChangeX', 0), units);
-          const toolChangeY = mapPositionToUnits(config.get('tool.toolChangeY', 0), units);
-          const toolChangeZ = mapPositionToUnits(config.get('tool.toolChangeZ', 0), units);
-          const toolProbeX = mapPositionToUnits(config.get('tool.toolProbeX', 0), units);
-          const toolProbeY = mapPositionToUnits(config.get('tool.toolProbeY', 0), units);
-          const toolProbeZ = mapPositionToUnits(config.get('tool.toolProbeZ', 0), units);
-          const toolProbeCustomCommands = ensureString(config.get('tool.toolProbeCustomCommands')).split('\n');
-          const toolProbeCommand = config.get('tool.toolProbeCommand', 'G38.2');
-          const toolProbeDistance = mapValueToUnits(config.get('tool.toolProbeDistance', 1), units);
-          const toolProbeFeedrate = mapValueToUnits(config.get('tool.toolProbeFeedrate', 10), units);
-          const touchPlateHeight = mapValueToUnits(config.get('tool.touchPlateHeight', 0), units);
-
-          const context = {
-            'tool_change_x': toolChangeX,
-            'tool_change_y': toolChangeY,
-            'tool_change_z': toolChangeZ,
-            'tool_probe_x': toolProbeX,
-            'tool_probe_y': toolProbeY,
-            'tool_probe_z': toolProbeZ,
-            'tool_probe_command': toolProbeCommand,
-            'tool_probe_distance': toolProbeDistance,
-            'tool_probe_feedrate': toolProbeFeedrate,
-            'touch_plate_height': touchPlateHeight,
-
-            // internal functions
-            'mapWCSToPValue': function (wcs) {
-              return {
-                'G54': 1,
-                'G55': 2,
-                'G56': 3,
-                'G57': 4,
-                'G58': 5,
-                'G59': 6,
-              }[wcs] || 0;
-            },
-          };
-
-          const lines = [];
-
-          // Wait until the planner queue is empty
-          lines.push('%wait');
-
-          // Remember original position and spindle state
-          lines.push('%_posx=posx');
-          lines.push('%_posy=posy');
-          lines.push('%_posz=posz');
-          lines.push('%_modal_spindle=modal.spindle');
-
-          // Stop the spindle
-          lines.push('M5');
-
-          // Absolute positioning
-          lines.push('G90');
-
-          // Move to the tool change position
-          lines.push('G53 G0 Z[tool_change_z]');
-          lines.push('G53 G0 X[tool_change_x] Y[tool_change_y]');
-          lines.push('%wait');
-
-          // Prompt the user to change the tool
-          lines.push('%msg Tool Change T[tool]');
-          lines.push('M0');
-
-          // Move to the tool probe position
-          lines.push('G53 G0 X[tool_probe_x] Y[tool_probe_y]');
-          lines.push('G53 G0 Z[tool_probe_z]');
-          lines.push('%wait');
-
-          if (toolChangePolicy === TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS) {
-            // Probe the tool
-            lines.push('G91 [tool_probe_command] F[tool_probe_feedrate] Z[tool_probe_z - mposz - tool_probe_distance]');
-            // Set coordinate system offset
-            lines.push('G10 L20 P[mapWCSToPValue(modal.wcs)] Z[touch_plate_height]');
-          } else if (toolChangePolicy === TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_TLO) {
-            // Probe the tool
-            lines.push('G91 [tool_probe_command] F[tool_probe_feedrate] Z[tool_probe_z - mposz - tool_probe_distance]');
-            // Pause for 1 second
-            lines.push('%wait 1');
-            // Set tool length offset
-            lines.push('{tofz:[posz - touch_plate_height]}');
-          } else if (toolChangePolicy === TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_CUSTOM_PROBING) {
-            lines.push(...toolProbeCustomCommands);
+          if (this.toolChangePreparing || this.toolChangeActive || this.pendingToolChange) {
+            return;
           }
-
-          // Move to the tool change position
-          lines.push('G53 G0 Z[tool_change_z]');
-          lines.push('G53 G0 X[tool_change_x] Y[tool_change_y]');
-          lines.push('%wait');
-
-          // Prompt the user to restart the spindle
-          lines.push('%msg Restart Spindle');
-          lines.push('M0');
-
-          // Restore the position and spindle state
-          lines.push('G90');
-          lines.push('G0 X[_posx] Y[_posy]');
-          lines.push('G0 Z[_posz]');
-          lines.push('[_modal_spindle]');
-
-          // Wait 5 seconds for the spindle to speed up
-          lines.push('%wait 5');
-
-          this.command('gcode', lines, context);
+          if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
+            this.emit('serialport:read', 'Pause the program before starting a tool change');
+            return;
+          }
+          this.toolChangePreparing = true;
+          if (!this.runMotionFence(() => {
+            this.toolChangePreparing = false;
+            this.toolChangeActive = true;
+            // An explicit tool-change request authorizes its macro motion only
+            // after the drain and fresh status prove the prior motion has ended.
+            if (this.runner.state.sr.machineState === 3) {
+              this.writeln('~');
+            }
+            this.dispatchToolChange();
+          }, true)) {
+            this.toolChangePreparing = false;
+          }
         },
         'autolevel:start': () => {
           const [params = {}] = args;
@@ -2248,6 +2369,11 @@ class TinyGController {
 
     quarantine() {
       this.setupGeneration++;
+      this.pendingToolChange = false;
+      this.toolChangePreparing = false;
+      this.toolChangeActive = false;
+      this.auxFencePending = false;
+      this.feederStopPending = false;
       this.setup.running = false;
       this.observationOnly = true;
       recoveryRequired.add(this.options.port);

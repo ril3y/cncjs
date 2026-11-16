@@ -83,7 +83,13 @@ const drainFeeder = (controller) => {
     }
     if (controller.transport.active.length) {
       const request = controller.transport.active[0];
-      controller.runner.parse(JSON.stringify({ r: request.n ? { n: request.n } : {}, f: [2, 0, 250] }));
+      let r = request.n ? { n: request.n } : {};
+      if (request.replyGC || request.line === 'M400') {
+        r = { gc: 'M400' };
+      } else if (request.line === '{sr:null}') {
+        r = { sr: { stat: 1 } };
+      }
+      controller.runner.parse(JSON.stringify({ tid: request.tid, r, f: [2, 0, 250] }));
     } else {
       controller.feeder.next();
     }
@@ -158,6 +164,8 @@ const setupCommands = [
 ];
 
 const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) => [
+  'FENCE',
+  '{sr:null}',
   'G4 P0.5',
   'M5',
   'G90',
@@ -178,7 +186,8 @@ const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) =
   'G0 Z0',
   'M5',
   'G4 P5',
-].map((line) => line + '\n');
+].flatMap(line => line === 'M0' ? [line, 'FENCE', '{sr:null}'] : [line])
+  .map(line => line === 'FENCE' ? expect.stringMatching(/^\{"tid":\d+,"gc":"M400"\}\n$/) : line + '\n');
 
 describe('TinyGController', () => {
   describe('command handlers', () => {
@@ -443,6 +452,22 @@ describe('TinyGController', () => {
       expect(data(writes)).not.toContain('~');
       expect(data(writes).filter(line => line.includes('M400'))).toHaveLength(1);
       expect(events.some(entry => entry.event === 'serialport:read' && entry.args[0].includes('manual feed hold'))).toBe(true);
+    });
+
+    test('MDI queued after M0 cannot reach firmware between the marker and its fence', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      controller.write('G1X999\n');
+      controller.write('{"gc":"G1X888"}\n');
+      controller.write('{"sr":null,"gc":"G1X777"}\n');
+      expect(data(writes)).toEqual(['N1M0\n']);
+      controller.command('gcode:resume');
+      expect(JSON.parse(data(writes)[1])).toMatchObject({ gc: 'M400' });
+      answerFence(controller, writes);
+      expect(data(writes).slice(2, 4)).toEqual(['~', 'G1X999\n']);
     });
 
     test.each(['alarm', 'startup'])('%s during an execution fence cannot release pending MDI motion', reason => {
@@ -903,6 +928,80 @@ describe('TinyGController', () => {
   });
 
   describe('tool:change', () => {
+    test('modern M6 waits for the long predecessor and fresh position before dispatching a macro', () => {
+      const { controller, writes } = setupController({
+        'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS,
+      });
+      controller.runner.settings.fb = 450.06;
+      seedModal(controller, { spindle: 'M5', wcs: 'G54' });
+      controller.command('gcode:load', 'tool.nc', 'G1X100\nT3M6\nG1X0');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      expect(data(writes)).toEqual(['N1G1X100\n', 'N2T3(M6)\n']);
+      expect(controller.feeder.size()).toBe(0);
+      controller.runner.parse('{"r":{"n":2},"f":[3,0,12]}');
+      controller.runner.parse('{"sr":{"stat":5}}');
+      controller.command('gcode:resume');
+      controller.command('feeder:start');
+      expect(writes).toHaveLength(3); // only the fence; no macro, cycle start or N3
+      answerFence(controller, writes);
+      expect(data(writes)[3]).toBe('{sr:null}\n');
+      expect(controller.feeder.size()).toBe(0);
+      controller.runner.parse('{"r":{"sr":{"stat":3,"posx":100,"posy":0,"posz":0}},"f":[3,0,12]}');
+      expect(data(writes).slice(4)).toEqual(['~', 'G4 P0.5\n']);
+      controller.command('gcode:resume');
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      drainFeeder(controller);
+      expect(data(writes)).toContain('G0 X100 Y0\n');
+      expect(data(writes)).not.toContain('N3G1X0\n');
+      expect(controller.toolChangeActive).toBe(false);
+    });
+
+    test('tool-change M0 prompt cannot cycle start before its own execution fence completes', () => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.toolChangeActive = true;
+      controller.command('gcode', ['M0', 'G1X2']);
+      controller.command('feeder:start');
+      expect(data(writes)).toEqual(['M0\n']);
+      controller.runner.parse('{"r":{"gc":"M0"},"f":[3,0,12]}');
+      controller.command('feeder:start');
+      expect(data(writes)).not.toContain('~');
+      answerFence(controller, writes);
+      controller.runner.parse('{"r":{"sr":{"stat":3}},"f":[3,0,12]}');
+      controller.command('feeder:start');
+      expect(data(writes)).toContain('~');
+      controller.runner.parse('{"r":{"qr":32},"f":[3,0,12]}');
+      expect(data(writes)).toContain('G1X2\n');
+    });
+
+    test.each(['fence', 'fresh status'])('startup during tool-change %s cannot dispatch the macro from a late reply', stage => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('tool:change');
+      const tid = JSON.parse(data(writes)[0]).tid;
+      if (stage === 'fresh status') {
+        answerFence(controller, writes);
+      }
+      const beforeReset = writes.length;
+      controller.runner.parse('{"sr":{"fb":450.06,"msg":"SYSTEM READY"}}');
+      controller.runner.parse(JSON.stringify({ tid, r: { gc: 'M400' }, f: [3, 0, 12] }));
+      controller.runner.parse('{"r":{"sr":{"stat":1,"posx":100}},"f":[3,0,12]}');
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.toolChangePreparing).toBe(false);
+      expect(controller.toolChangeActive).toBe(false);
+      expect(controller.feeder.size()).toBe(0);
+      expect(writes).toHaveLength(beforeReset);
+    });
+
+    test.each(['T3 M6 S1200 G90', 'N15 T3 M06 S1200 G90'])('legacy M6 stop substitution preserves other words in %s', line => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 449.02;
+      controller.command('gcode:load', 'tool.nc', line);
+      controller.command('gcode:start');
+      expect(data(writes)).toEqual(['N1T3M0S1200G90\n']);
+    });
+
     test.each([440.21, 449.02])('legacy %s automatic M6 never dispatches a macro before Resume', fb => {
       const { controller, writes, events } = setupController({
         'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS,
