@@ -1,6 +1,9 @@
 // Bound unread UART input, not the firmware's fragmented line-pool storage.
 // Every ordinary wire byte stays charged until its own matched reply proves the
 // line left the UART. This rolling window permits refill while older lines wait.
+// RX_BUFFER_SIZE=250 uses indices 1..249 and reserves head==tail for empty/full.
+// A lone ordinary line must fit all 248 usable ring slots even if reading stalls.
+const MAX_WIRE_BYTES = 248;
 const PAUSED_CONTROL_FIELD = '["\']?(?:mfo|mfc|mfe|sso|ssc|sse|sr|stat|qr|rx|mt|pwr|clear)["\']?\\s*:\\s*(?:null|true|false|""|-?\\d+(?:\\.\\d+)?)';
 const PAUSED_CONTROL_LINE = new RegExp(`^\\{\\s*${PAUSED_CONTROL_FIELD}(?:\\s*,\\s*${PAUSED_CONTROL_FIELD})*\\s*\\}$`, 'i');
 
@@ -44,16 +47,19 @@ export default class TinyGTransport {
     }
     line = String(line).trim();
     const bytes = Buffer.byteLength(line + '\n');
-    // Include LF on the wire and leave room for the firmware's terminating NUL.
+    // Count the final numbered wire command and LF, not just source characters.
+    // The firmware parser's larger line buffer does not increase UART capacity.
     if (
       !line ||
       /[\r\n]/.test(line) ||
-      bytes > 249 ||
+      bytes > MAX_WIRE_BYTES ||
       this.pending.length >= 64 ||
       this.failed
     ) {
       this.fail(
-        'TinyG command rejected: invalid length, full queue, or transport requires reconnect'
+        bytes > MAX_WIRE_BYTES
+          ? `TinyG command${options.n ? ` N${options.n}` : ''} is ${bytes} wire bytes including LF${options.n ? ' (after numbering)' : ''}; maximum is ${MAX_WIRE_BYTES}. Shorten this command before restarting.`
+          : 'TinyG command rejected: invalid length, full queue, or transport requires reconnect'
       );
       if (options.done) {
         options.done(null);

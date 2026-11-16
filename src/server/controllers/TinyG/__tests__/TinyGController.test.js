@@ -460,6 +460,19 @@ describe('TinyGController', () => {
       expect(controller.transport.failed).toBe(true);
     });
 
+    test('reports numbered wire length when a parser-valid source line exceeds the UART budget', () => {
+      const { controller, writes, events } = setupController();
+      // 247 source bytes become 249 with N1, and 250 with LF: the bench long249 case.
+      const source = 'G1Y0.'.padEnd(247, '0');
+      controller.command('gcode:load', 'long249.nc', source);
+      controller.command('gcode:start');
+      expect(writes).toHaveLength(0);
+      expect(controller.ready).toBe(false);
+      expect(controller.transport.failed).toBe(true);
+      expect(events.some(event => event.event === 'serialport:read' &&
+        event.args[0] === 'TinyG command N1 is 250 wire bytes including LF (after numbering); maximum is 248. Shorten this command before restarting.')).toBe(true);
+    });
+
     test.each(['M0', 'M1'])('ordered %s reaches the board before Resume and blocks later data', marker => {
       const { controller, writes } = setupController();
       controller.runner.settings.fb = 450.06;

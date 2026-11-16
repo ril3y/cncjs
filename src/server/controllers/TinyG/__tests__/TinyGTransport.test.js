@@ -151,14 +151,40 @@ test('reset suspends admission before cancellation callbacks and ignores late re
   expect(transport.slots).toBe(0);
 });
 
-test('249-byte isolated line leaves no space for ordinary controls', () => {
+test('248-byte isolated line leaves no space for ordinary controls', () => {
   const { transport, write } = setup();
-  transport.enqueue('N1' + 'X'.repeat(246), { n: 1 });
+  transport.enqueue('N1' + 'X'.repeat(245), { n: 1 });
   transport.enqueue('{sr:null}');
   expect(write).toHaveBeenCalledTimes(1);
-  expect(transport.bytes).toBe(249);
+  expect(transport.bytes).toBe(248);
   transport.receive({ r: { n: 1 }, f: [3, 0, 12] });
   expect(write).toHaveBeenCalledTimes(2);
+});
+
+test.each([1, 10, 100])('wire limit includes the full N%s prefix and LF', n => {
+  const { transport, write, fault } = setup();
+  const line = `N${n}G1X0.`.padEnd(247, '0');
+  transport.enqueue(line, { n });
+  expect(write).toHaveBeenCalledWith(line + '\n');
+  expect(transport.bytes).toBe(248);
+  expect(fault).not.toHaveBeenCalled();
+  transport.receive({ r: { n }, f: [3, 0, 12] });
+  const done = jest.fn();
+  transport.enqueue(line + '0', { n, done });
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(fault).toHaveBeenCalledWith(`TinyG command N${n} is 249 wire bytes including LF (after numbering); maximum is 248. Shorten this command before restarting.`);
+  expect(done).toHaveBeenCalledWith(null);
+  expect(transport.bytes).toBe(0);
+});
+
+test('wire limit counts encoded bytes, not JavaScript characters', () => {
+  const { transport, write, fault } = setup();
+  const line = 'N1' + 'é'.repeat(123);
+  expect(line.length).toBeLessThan(248);
+  expect(Buffer.byteLength(line + '\n')).toBe(249);
+  transport.enqueue(line, { n: 1 });
+  expect(write).not.toHaveBeenCalled();
+  expect(fault).toHaveBeenCalledWith(expect.stringContaining('249 wire bytes'));
 });
 
 test('pause blocks queued program lines while allowing a bounded control request', () => {
