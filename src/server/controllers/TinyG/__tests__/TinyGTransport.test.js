@@ -78,6 +78,55 @@ test('ambiguous errors stop admission instead of guessing an owner', () => {
   expect(fault).toHaveBeenCalledTimes(1);
 });
 
+test('an echoed program error without n releases only the matching request', () => {
+  const { transport, fault } = setup();
+  const rejected = jest.fn();
+  const next = jest.fn();
+  const control = jest.fn();
+  transport.enqueue('N11G43H6', { n: 11, done: rejected });
+  transport.enqueue('N12G1X1', { n: 12, done: next });
+  transport.enqueue('{mfo:null}', { done: control });
+  const bytes = transport.bytes;
+  const response = { r: { gc: 'N11G43H6' }, f: [3, 131, 6] };
+
+  transport.receive(response);
+
+  expect(rejected).toHaveBeenCalledWith(response);
+  expect(next).not.toHaveBeenCalled();
+  expect(control).not.toHaveBeenCalled();
+  expect(transport.active.map(request => request.line)).toEqual(['N12G1X1', '{mfo:null}']);
+  expect(transport.bytes).toBe(bytes - Buffer.byteLength('N11G43H6\n'));
+  expect(transport.slots).toBe(6);
+  expect(fault).not.toHaveBeenCalled();
+
+  const remainingBytes = transport.bytes;
+  transport.receive(response);
+  expect(rejected).toHaveBeenCalledTimes(1);
+  expect(transport.bytes).toBe(remainingBytes);
+  expect(fault).toHaveBeenCalledTimes(1);
+});
+
+test.each([
+  { r: { gc: 'N10G43H6' }, f: [3, 131, 6] },
+  { r: { gc: 'G43H6' }, f: [3, 131, 6] },
+  { r: { n: 12, gc: 'N11G43H6' }, f: [3, 131, 6] },
+  { r: {}, f: [3, 131, 6] },
+  { r: { gc: 'N11G43H6' }, f: [3, 0, 6] },
+])('a missing or conflicting program error identity cannot release credit: %j', response => {
+  const { transport, fault } = setup();
+  const done = jest.fn();
+  transport.enqueue('N11G43H6', { n: 11, done });
+  transport.enqueue('N12G1X1', { n: 12, done });
+  const bytes = transport.bytes;
+
+  transport.receive(response);
+
+  expect(done).not.toHaveBeenCalled();
+  expect(transport.active).toHaveLength(2);
+  expect(transport.bytes).toBe(bytes);
+  expect(fault).toHaveBeenCalledTimes(1);
+});
+
 test('an unrelated generic success cannot acknowledge even a sole program line', () => {
   const { transport, fault } = setup();
   const done = jest.fn();

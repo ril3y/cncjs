@@ -153,6 +153,11 @@ export default class TinyGTransport {
     const n = data.r && Number(data.r.n);
     let index = this.active.findIndex((r) => r.n && r.n === n &&
       (!data.r.gc || data.r.gc === r.line));
+    if (index < 0 && data.r && data.r.n === undefined && data.f[1]) {
+      // Rejected G-code can echo the numbered wire command without r.n. Only
+      // that exact outstanding command may own the error and release its bytes.
+      index = this.active.findIndex(request => request.n && data.r.gc === request.line);
+    }
     if (index < 0) {
       // Never guess ownership of a footer-only error with multiple requests.
       const controls = this.active.filter((r) => !r.n);

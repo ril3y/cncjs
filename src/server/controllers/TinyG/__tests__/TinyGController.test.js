@@ -2182,6 +2182,34 @@ describe('TinyGController', () => {
       expect(reads).toContain('> G1 X1 (ln=3)');
     });
 
+    test('a rejected program echo without n pauses without quarantining or refilling', async () => {
+      const { controller, writes, events } = setupController();
+      await connect(controller, writes);
+
+      controller.command('gcode:load', 'unsupported.nc', ['G43 H6', ...Array(20).fill('G1 X1')].join('\n'));
+      controller.command('gcode:start');
+      const sent = writes.length;
+      expect(data(writes)[0]).toBe('N1G43H6\n');
+      expect(controller.sender.state.sent).toBeLessThan(21);
+
+      controller.runner.parse('{"r":{"gc":"N1G43H6"},"f":[3,131,6]}');
+
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      expect(controller.sender.state.received).toBe(1);
+      expect(controller.transport.failed).toBe(false);
+      expect(controller.transport.suspended).toBe(false);
+      expect(writes).toHaveLength(sent);
+      const reads = events.filter(entry => entry.event === 'serialport:read').map(entry => entry.args[0]);
+      expect(reads).toContain('> G43 H6 (ln=2)');
+      expect(reads).not.toContain('Unmatched TinyG reply; reconnect before continuing');
+
+      // Replies for already-written lines must not refill the paused program.
+      [...controller.transport.active].forEach(request => respond(controller, request.n, 10));
+      expect(writes).toHaveLength(sent);
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      expect(controller.transport.failed).toBe(false);
+    });
+
     test('pause holds the sender while the lines in flight are answered, and resume refills the board', async () => {
       const { controller, writes } = setupController();
       await connect(controller, writes);
