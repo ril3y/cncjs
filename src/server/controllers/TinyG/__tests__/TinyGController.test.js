@@ -99,7 +99,11 @@ const drainFeeder = (controller) => {
   let limit = 1000;
   while (limit-- > 0 && (controller.feeder.size() || controller.transport.active.length || controller.transport.pending.length)) {
     if (controller.feeder.state.hold) {
-      controller.feeder.unhold();
+      if (controller.feederStop && controller.feederStop.ready) {
+        controller.command('feeder:start');
+      } else if (!controller.feederStop) {
+        controller.feeder.unhold();
+      }
     }
     if (controller.transport.active.length) {
       const request = controller.transport.active[0];
@@ -207,8 +211,8 @@ const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) =
   'G0 Z0',
   'M5',
   'G4 P5',
-].flatMap(line => line === 'M0' ? [line, 'FENCE', '{"stat":null}'] : [line])
-  .map(line => line === 'FENCE' ? expect.stringMatching(/^\{"tid":\d+,"gc":"M400"\}\n$/) : line + '\n');
+].flatMap(line => line === 'M0' ? [line, 'FENCE', ...contextQueries, '~', '{"qr":""}'] : [line])
+  .map(line => line === 'FENCE' ? expect.stringMatching(/^\{"tid":\d+,"gc":"M400"\}\n$/) : (line === '~' ? line : line + '\n'));
 
 describe('TinyGController', () => {
   describe('command handlers', () => {
@@ -718,6 +722,106 @@ describe('TinyGController', () => {
       expect(writes).toEqual([]);
     });
 
+    test.each(['M0', 'M1', 'G1X2M0'])('ordinary feeder %s owns every resume path until execution completes', marker => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode', [marker, 'G1X3']);
+      const resumeAll = () => {
+        controller.command('feeder:start');
+        controller.command('gcode:resume');
+        controller.command('cyclestart');
+        controller.write('~');
+      };
+      resumeAll();
+      expect(data(writes)).toEqual([marker + '\n']);
+      controller.command('tool:change');
+      expect(controller.toolChangePreparing).toBe(false);
+      controller.write('G1X999\n');
+      controller.runner.parse(JSON.stringify({ r: { gc: marker }, f: [3, 0, 12] }));
+      resumeAll();
+      expect(data(writes)).not.toContain('~');
+      expect(data(writes)).not.toContain('G1X999\n');
+      answerFence(controller, writes);
+      resumeAll();
+      expect(data(writes)).not.toContain('~');
+      controller.runner.parse('{"r":{"stat":1},"f":[3,0,12]}');
+      expect(data(writes)).not.toContain('~');
+      controller.command('feeder:start');
+      expect(data(writes)).toContain('~');
+      expect(data(writes).indexOf('G1X999\n')).toBeGreaterThan(data(writes).indexOf('~'));
+      expect(controller.feederStop).toBe(null);
+    });
+
+    test.each(['feeder:start', 'cyclestart', 'raw'])('%s cannot bypass a numbered program stop', resumePath => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'stop.nc', 'G1X100\nM0\nG1X0');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      const resume = () => resumePath === 'raw' ? controller.write('~') : controller.command(resumePath);
+      resume();
+      expect(data(writes)).not.toContain('~');
+      controller.runner.parse('{"r":{"n":2},"f":[3,0,12]}');
+      controller.command('gcode', 'G1X777M0');
+      expect(controller.feederStop).toBe(null);
+      resume();
+      expect(data(writes)).not.toContain('~');
+      controller.command('gcode:resume');
+      expect(data(writes).filter(line => line.includes('M400'))).toHaveLength(1);
+      answerFence(controller, writes);
+      expect(data(writes)).toContain('~');
+    });
+
+    test.each([440.21, 449.02])('legacy %s ordinary feeder stop refuses unsupported resume', fb => {
+      const { controller, writes, events } = setupController();
+      controller.runner.settings.fb = fb;
+      controller.command('gcode', ['M0', 'G1X2']);
+      controller.runner.parse('{"r":{"gc":"M0"},"f":[3,0,250]}');
+      controller.command('feeder:start');
+      controller.command('cyclestart');
+      controller.write('~');
+      expect(data(writes)).toEqual(['M0\n']);
+      expect(events.some(entry => entry.event === 'serialport:read' && entry.args[0].includes('no supported execution fence'))).toBe(true);
+    });
+
+    test('manual M6 inside feeder commands explicitly refuses automatic macro dispatch', () => {
+      const { controller, writes } = setupController({
+        'tool.toolChangePolicy': TOOL_CHANGE_POLICY_MANUAL_TOOL_CHANGE_WCS
+      });
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode', ['M6', 'G1X2']);
+      controller.runner.parse('{"r":{"gc":"(M6)"},"f":[3,0,12]}');
+      controller.command('feeder:start');
+      controller.command('cyclestart');
+      expect(data(writes)).toEqual(['(M6)\n']);
+      expect(controller.toolChangePreparing).toBe(false);
+      expect(controller.toolChangeActive).toBe(false);
+    });
+
+    test.each(['startup', 'error', 'cancel'])('%s invalidates ordinary feeder-stop readiness and alternate cycle starts', reason => {
+      const { controller, writes } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode', ['M0', 'G1X2']);
+      controller.runner.parse('{"r":{"gc":"M0"},"f":[3,0,12]}');
+      const tid = JSON.parse(data(writes)[1]).tid;
+      if (reason === 'startup') {
+        controller.runner.parse('{"sr":{"fb":450.06,"msg":"SYSTEM READY"}}');
+      } else if (reason === 'error') {
+        controller.connectionEventListener.error(new Error('driver error during feeder fence'));
+      } else {
+        controller.command('feeder:stop');
+      }
+      const before = writes.length;
+      controller.runner.parse(JSON.stringify({ tid, r: { gc: 'M400' }, f: [3, 0, 12] }));
+      controller.runner.parse('{"r":{"stat":3},"f":[3,0,12]}');
+      controller.command('feeder:start');
+      controller.command('cyclestart');
+      controller.write('~');
+      expect(writes).toHaveLength(before);
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.feederStop).toBe(null);
+    });
+
     test('feeder:stop clears the queue without writing', () => {
       const { controller, writes } = setupController();
 
@@ -1089,7 +1193,7 @@ describe('TinyGController', () => {
       controller.command('feeder:start');
       expect(data(writes)).not.toContain('~');
       answerFence(controller, writes);
-      controller.runner.parse('{"r":{"stat":3},"f":[3,0,12]}');
+      answerContext(controller, { stat: 3 });
       controller.command('feeder:start');
       expect(data(writes)).toContain('~');
       controller.runner.parse('{"r":{"qr":32},"f":[3,0,12]}');

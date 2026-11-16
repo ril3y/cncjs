@@ -145,6 +145,10 @@ class TinyGController {
 
     feederStopPending = false;
 
+    feederStop = null;
+
+    cycleStartOwner = Symbol('TinyG verified cycle start');
+
     programEpoch = 0;
 
     recovery = null;
@@ -355,6 +359,7 @@ class TinyGController {
           // M0 Program Pause
           if (words.find(isM0)) {
             log.debug('M0 Program Pause');
+            this.markFeederStop('M0');
 
             this.feeder.hold({
               data: 'M0',
@@ -365,6 +370,7 @@ class TinyGController {
           // M1 Program Pause
           if (words.find(isM1)) {
             log.debug('M1 Program Pause');
+            this.markFeederStop('M1');
 
             this.feeder.hold({
               data: 'M1',
@@ -386,6 +392,7 @@ class TinyGController {
             if (toolChangePolicy === TOOL_CHANGE_POLICY_IGNORE_M6_COMMANDS) {
               // Ignore M6 commands
               line = replaceM6(line, (x) => `(${x})`); // replace with parentheses
+              this.markFeederStop('M6');
 
               this.feeder.hold({
                 data: 'M6',
@@ -396,13 +403,15 @@ class TinyGController {
             } else if (isManualToolChange) {
               // Manual Tool Change
               line = replaceM6(line, (x) => `(${x})`); // replace with parentheses
+              this.markFeederStop('M6');
+              this.feederStop.blocked = true;
 
               this.feeder.hold({
                 data: 'M6',
                 msg: this.messageSlot.take() ?? originalLine,
               });
 
-              this.command('tool:change');
+              this.emit('serialport:read', 'Automatic M6 macros inside feeder commands are unsupported; cancel and use a program file or standalone tool change');
             }
           }
 
@@ -432,12 +441,13 @@ class TinyGController {
         });
 
         const toolMacro = this.toolChangeActive && context[this.toolChangeOwner] === true;
-        const toolStop = toolMacro && /^M0$/i.test(line);
-        if (toolStop) {
-          this.feederStopPending = true;
+        const stop = this.feederStop && this.feederStop.awaitingLine ? this.feederStop : null;
+        if (stop) {
+          stop.awaitingLine = false;
         }
         this.transport.enqueue(line, {
           allowPaused: toolMacro,
+          stopMarker: !!stop,
           done: response => {
             if (!response) {
               return;
@@ -446,10 +456,22 @@ class TinyGController {
               this.failRecovery(`TinyG tool-change command failed (${response.f[1]})`);
               return;
             }
-            if (toolStop) {
+            if (stop) {
+              if (stop !== this.feederStop) {
+                return;
+              }
+              if (response.f[1]) {
+                this.failRecovery(`TinyG feeder stop failed (${response.f[1]}); explicit Reset recovery is required`);
+                return;
+              }
+              if (stop.blocked || !(Number(this.runner.settings.fb) >= 450.01)) {
+                this.emit('serialport:read', 'This feeder stop has no supported execution fence; cancel and use program pause handling or update TinyG');
+                return;
+              }
               this.runMotionFence(() => {
                 this.feederStopPending = false;
-              }, true);
+                stop.ready = true;
+              }, toolMacro ? 'context' : true);
               return;
             }
             this.feeder.next();
@@ -661,6 +683,7 @@ class TinyGController {
         this.toolChangePreparing = false;
         this.toolChangeActive = false;
         this.feederStopPending = false;
+        this.feederStop = null;
         this.programEpoch++;
         this.transport.paused = true;
         this.transport.pauseThrough = 0;
@@ -1260,6 +1283,16 @@ class TinyGController {
           });
         }
       });
+    }
+
+    markFeederStop(kind) {
+      // Recognition precedes hold notifications and the marker write, so any
+      // alternate resume or ordinary writer already sees the owned barrier.
+      if (!this.feederStop) {
+        this.feederStop = { kind, awaitingLine: true, ready: false };
+      }
+      this.feederStopPending = true;
+      this.transport.motionBlocked = true;
     }
 
     runMotionFence(done, readStatus = false) {
@@ -1926,6 +1959,10 @@ class TinyGController {
             this.emit('serialport:read', 'This job requires unsupported legacy tool-change automation; stop and select manual M6 handling or update the firmware');
             return;
           }
+          if (this.feederStop) {
+            this.emit('serialport:read', 'Complete or cancel the feeder stop before resuming the program');
+            return;
+          }
           const barrier = this.transport.pauseThrough;
           if (barrier && [...this.transport.active, ...this.transport.pending].some(request => request.n && request.n <= barrier)) {
             this.emit('serialport:read', 'Waiting for the program stop marker before resuming');
@@ -1996,19 +2033,30 @@ class TinyGController {
           this.command('gcode', commands, context);
         },
         'feeder:start': () => {
+          if (this.transport.pauseThrough && !this.toolChangeActive) {
+            this.emit('serialport:read', 'Use program Resume to complete the pending program-stop fence');
+            return;
+          }
           if (this.toolChangePreparing || this.auxFencePending || this.feederStopPending) {
             return;
           }
           if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
             return;
           }
-          this.writeln('~'); // cycle start
+          if (this.feederStop) {
+            if (!this.feederStop.ready) {
+              return;
+            }
+            this.feederStop = null;
+            this.transport.motionBlocked = this.toolChangeActive;
+          }
+          this.writeln('~', { [this.cycleStartOwner]: true }); // verified cycle start
           this.writeln('{"qr":""}'); // queue report
           this.feeder.unhold();
           this.feeder.next();
         },
         'feeder:stop': () => {
-          if (this.toolChangePreparing || this.toolChangeActive) {
+          if (this.toolChangePreparing || this.toolChangeActive || this.feederStop) {
             this.failRecovery('TinyG tool-change cancelled; explicit Reset recovery is required');
             return;
           }
@@ -2021,6 +2069,17 @@ class TinyGController {
           this.writeln('{"qr":""}'); // queue report
         },
         'cyclestart': () => {
+          if (this.feederStop) {
+            this.command('feeder:start');
+            return;
+          }
+          if (this.transport.pauseThrough) {
+            this.command('gcode:resume');
+            return;
+          }
+          if (this.toolChangePreparing || this.auxFencePending || this.stopProbePending) {
+            return;
+          }
           this.event.trigger('cyclestart');
 
           this.writeln('~'); // cycle start
@@ -2116,8 +2175,8 @@ class TinyGController {
         },
         'gcode': () => {
           const [commands, context = {}] = args;
-          if ((this.toolChangePreparing || this.toolChangeActive) && context[this.toolChangeOwner] !== true) {
-            this.emit('serialport:read', 'Complete or cancel the tool change before sending other G-code');
+          if ((this.toolChangePreparing || this.toolChangeActive || this.transport.pauseThrough) && context[this.toolChangeOwner] !== true) {
+            this.emit('serialport:read', 'Complete or cancel the pending program stop or tool change before sending other G-code');
             return;
           }
           const data = ensureArray(commands)
@@ -2201,6 +2260,10 @@ class TinyGController {
           if (this.toolChangePreparing || this.toolChangeActive || this.pendingToolChange) {
             return;
           }
+          if (this.feederStop) {
+            this.emit('serialport:read', 'Complete or cancel the feeder stop before starting a tool change');
+            return;
+          }
           if (this.workflow.state === WORKFLOW_STATE_RUNNING) {
             this.emit('serialport:read', 'Pause the program before starting a tool change');
             return;
@@ -2213,7 +2276,7 @@ class TinyGController {
             // An explicit tool-change request authorizes its macro motion only
             // after the drain and fresh status prove the prior motion has ended.
             if (this.runner.state.sr.machineState === 3) {
-              this.writeln('~');
+              this.writeln('~', { [this.cycleStartOwner]: true });
             }
             this.dispatchToolChange();
           }, 'context')) {
@@ -2423,6 +2486,7 @@ class TinyGController {
       this.toolChangeActive = false;
       this.auxFencePending = false;
       this.feederStopPending = false;
+      this.feederStop = null;
       this.setup.running = false;
       this.observationOnly = true;
       recoveryRequired.add(this.options.port);
@@ -2519,6 +2583,16 @@ class TinyGController {
       // Assertion check
       if (this.isClose()) {
         log.error(`Serial port "${this.options.port}" is not accessible`);
+        return;
+      }
+
+      if (String(data).trim() === '~' && (this.transport.suspended || this.transport.failed)) {
+        this.emit('serialport:read', 'TinyG cycle start requires successful recovery first');
+        return;
+      }
+      if (String(data).trim() === '~' && !(context && context[this.cycleStartOwner]) &&
+          (this.feederStop || this.transport.pauseThrough || this.toolChangePreparing || this.auxFencePending || this.stopProbePending)) {
+        this.command('cyclestart');
         return;
       }
 

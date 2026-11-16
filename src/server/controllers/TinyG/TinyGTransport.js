@@ -87,7 +87,7 @@ export default class TinyGTransport {
     try {
       while (this.pending.length) {
         const held = request => {
-          if (request.fence || request.allowPaused || (!this.paused && !this.motionBlocked)) {
+          if (request.fence || request.stopMarker || request.allowPaused || (!this.paused && !this.motionBlocked)) {
             return false;
           }
           if (request.n) {
