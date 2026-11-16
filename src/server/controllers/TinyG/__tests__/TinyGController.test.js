@@ -1685,6 +1685,73 @@ describe('TinyGController', () => {
       expect(controller.transport.failed).toBe(true);
     });
 
+    const waitForStatusReportWrite = async (build = 450.06) => {
+      const { controller, writes } = setupController();
+      let reportWritten;
+      const waiting = new Promise(resolve => {
+        reportWritten = resolve;
+      });
+      respondToWrites(controller, writes, line => {
+        if (line.startsWith('{sr:{')) {
+          reportWritten();
+          return null;
+        }
+        if (line === '{fb:n}') {
+          return JSON.stringify({ r: { fb: build }, f: [2, 0, 250] });
+        }
+        if (line === '{stat:n}') {
+          return '{"r":{"stat":1},"f":[2,0,250]}';
+        }
+        return '{"r":{},"f":[2,0,250]}';
+      });
+      const initialization = controller.initController();
+      await waiting;
+      return { controller, writes, initialization };
+    };
+
+    test.each([440.21, 450.06])('waits for slow persisted sr on build %s without sending another setup line', async build => {
+      const { controller, writes, initialization } = await waitForStatusReportWrite(build);
+      const count = writes.length;
+      await new Promise(resolve => {
+        setTimeout(resolve, 1100);
+      });
+      expect(writes).toHaveLength(count);
+      expect(controller.ready).toBe(false);
+      expect(controller.transport.failed).toBe(false);
+      controller.runner.parse('{"r":{"sr":{}},"f":[2,0,250]}');
+      await initialization;
+      expect(data(writes)[count]).toBe('{sys:n}\n');
+      expect(controller.ready).toBe(true);
+    });
+
+    test('a missing persisted sr reply times out and a late reply cannot restart setup', async () => {
+      const { controller, writes, initialization } = await waitForStatusReportWrite();
+      const count = writes.length;
+      await initialization;
+      expect(controller.transport.failed).toBe(true);
+      expect(controller.ready).toBe(false);
+      controller.runner.parse('{"r":{"sr":{}},"f":[2,0,250]}');
+      await new Promise(resolve => {
+        setImmediate(resolve);
+      });
+      expect(writes).toHaveLength(count);
+      expect(controller.ready).toBe(false);
+    }, 10000);
+
+    test('serial failure while waiting for persisted sr cancels setup despite a late reply', async () => {
+      const { controller, writes, initialization } = await waitForStatusReportWrite();
+      const count = writes.length;
+      controller.connectionEventListener.error(new Error('USB disconnected during EEPROM write'));
+      await initialization;
+      controller.runner.parse('{"r":{"sr":{}},"f":[2,0,250]}');
+      await new Promise(resolve => {
+        setImmediate(resolve);
+      });
+      expect(writes).toHaveLength(count);
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.ready).toBe(false);
+    });
+
     // In ALARM a SET is answered with status 204 (newer firmware) and a GET still works.
     const alarmReply = (board) => (line) => {
       if (line === '{fb:n}') {

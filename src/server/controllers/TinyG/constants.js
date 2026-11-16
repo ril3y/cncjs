@@ -12,8 +12,10 @@ export const TINYG_PLANNER_BUFFER_HIGH_WATER_MARK = 7;
 // TinyG has a 254 byte serial buffer that receives raw ASCII commands.
 export const TINYG_SERIAL_BUFFER_LIMIT = 254;
 
-// How long to wait for the reply to each connect-time setup command (in milliseconds)
+// Default reply deadline for connect-time setup commands (in milliseconds)
 export const TINYG_SETUP_RESPONSE_TIMEOUT = 1000;
+// Replacing sr persists up to 30 EEPROM slots and can take over one second.
+export const TINYG_STATUS_REPORT_SETUP_TIMEOUT = 5000;
 
 // RX line (packet) mode: firmware build 450.02 and later (N55 line-slot leak fixed)
 // https://github.com/synthetos/TinyG/wiki/Sending-Data-to-TinyG-using-RX-Packet-Mode

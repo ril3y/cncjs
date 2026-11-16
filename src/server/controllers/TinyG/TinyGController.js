@@ -58,6 +58,7 @@ import {
   TINYG_MACHINE_STATE_ALARM,
   TINYG_MACHINE_STATE_SHUTDOWN,
   TINYG_SETUP_RESPONSE_TIMEOUT,
+  TINYG_STATUS_REPORT_SETUP_TIMEOUT,
 } from './constants';
 
 const SENDER_STATUS_NONE = 'none';
@@ -1017,14 +1018,14 @@ class TinyGController {
       const generation = ++this.setupGeneration;
       let rejected = false;
       let lastResponse = null;
-      const send = (cmd = '', optional = false) => new Promise((resolve, reject) => {
+      const send = (cmd = '', optional = false, timeout = TINYG_SETUP_RESPONSE_TIMEOUT) => new Promise((resolve, reject) => {
         if (generation !== this.setupGeneration || this.isClose() || this.transport.failed || this.transport.suspended) {
           reject(new Error('TinyG connection unavailable')); return;
         }
         const timer = setTimeout(() => {
           this.transport.fail('TinyG setup timed out; reconnect before continuing');
           reject(new Error('TinyG setup timed out'));
-        }, TINYG_SETUP_RESPONSE_TIMEOUT);
+        }, timeout);
         this.transport.enqueue(cmd, { done: response => {
           clearTimeout(timer);
           if (!response) {
@@ -1105,12 +1106,14 @@ class TinyGController {
           this.sr.sse = true;
           this.sr.ssc = true;
         }
+        // Persisting all 30 slots can exceed the ordinary command deadline. Keep
+        // the write serialized and wait for its reply before sending more input.
         await send(relaxedJSON({
           // Returns an object composed of the picked properties
           sr: _.pickBy(this.sr, (value, key) => {
             return !!value;
           })
-        }));
+        }), false, TINYG_STATUS_REPORT_SETUP_TIMEOUT);
 
         // Request system settings
         await send('{sys:n}');
