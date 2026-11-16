@@ -216,6 +216,65 @@ const toolChangeWrites = ({ changeZ, changeXY, probeXY, probeZ, policyLines }) =
 
 describe('TinyGController', () => {
   describe('command handlers', () => {
+    test.each(['active', 'pending'])('start visibly refuses %s ordinary work and never retries it later', owner => {
+      const { controller, writes, events } = setupController();
+      controller.command('gcode:load', 'new.nc', 'G1 X2');
+      if (owner === 'pending') {
+        controller.transport.enqueue('{sso:null}', { backgroundPoll: true });
+      }
+      controller.write('G1X9\n');
+      const before = writes.length;
+
+      controller.command('gcode:start');
+
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_IDLE);
+      expect(writes).toHaveLength(before);
+      expect(events.some(entry => entry.event === 'serialport:read' && /busy/i.test(entry.args[0]))).toBe(true);
+      if (owner === 'pending') {
+        controller.runner.parse('{"r":{"sso":1},"f":[2,0,250]}');
+      }
+      controller.runner.parse('{"r":{"gc":"G1X9"},"f":[2,0,250]}');
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_IDLE);
+      expect(data(writes).some(line => /^N\d/.test(line))).toBe(false);
+    });
+
+    test('Start cannot restart an owned program stop instead of Resume', () => {
+      const { controller, writes, events } = setupController();
+      controller.runner.settings.fb = 450.06;
+      controller.command('gcode:load', 'stop.nc', 'M0\nG1X1');
+      controller.command('gcode:start');
+      controller.runner.parse('{"r":{"n":1},"f":[3,0,12]}');
+      const before = writes.length;
+      const barrier = controller.transport.pauseThrough;
+
+      controller.command('gcode:start');
+
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_PAUSED);
+      expect(controller.transport.pauseThrough).toBe(barrier);
+      expect(writes).toHaveLength(before);
+      expect(events.some(entry => entry.event === 'serialport:read' && /Resume/.test(entry.args[0]))).toBe(true);
+    });
+
+    test.each(['observationOnly', 'setup', 'notReady', 'failed', 'suspended'])('start visibly refuses %s admission', state => {
+      const { controller, writes, events } = setupController();
+      controller.command('gcode:load', 'new.nc', 'G1 X2');
+      if (state === 'observationOnly') {
+        controller.observationOnly = true;
+      } else if (state === 'setup') {
+        controller.setup.running = true;
+      } else if (state === 'notReady') {
+        controller.ready = false;
+      } else {
+        controller.transport[state] = true;
+      }
+
+      controller.command('gcode:start');
+
+      expect(controller.workflow.state).toBe(WORKFLOW_STATE_IDLE);
+      expect(writes).toHaveLength(0);
+      expect(events.some(entry => entry.event === 'serialport:read' && /start/i.test(entry.args[0]))).toBe(true);
+    });
+
     test.each([
       ['feedhold', ['!', '{"qr":""}\n']],
       ['cyclestart', ['~', '{"qr":""}\n']],
@@ -2016,6 +2075,33 @@ describe('TinyGController', () => {
     const respond = (controller, n, free, status = 0) => {
       controller.runner.parse(`{"r":{"n":${n}},"f":[3,${status},${free}]}`);
     };
+
+    test.each([[1, true], [3, true], [4, true], [3, false]])('start from stat %s survives a background poll with line mode %s', async (stat, lineMode) => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate', 'setTimeout', 'clearTimeout'] });
+      try {
+        const { controller, writes, events } = setupController({ 'state.controller.tinyg.lineMode': lineMode });
+        await connect(controller, writes, { fb: 450.06 });
+        controller.runner.parse(JSON.stringify({ sr: { stat } }));
+        controller.command('gcode:load', 'new.nc', 'G1 X1\nG1 X2');
+        jest.advanceTimersByTime(250);
+        expect(data(writes)).toEqual(['{sso:null,ssc:null,sse:null}\n']);
+
+        controller.command('gcode:start');
+
+        expect(controller.workflow.state).toBe(WORKFLOW_STATE_RUNNING);
+        if (!lineMode) {
+          expect(writes).toHaveLength(1); // Serialization still waits for the poll reply.
+        }
+        controller.runner.parse(JSON.stringify({ r: { sso: 1, ssc: 1, sse: 1 }, f: [lineMode ? 3 : 2, 0, lineMode ? 10 : 250] }));
+        expect(data(writes)).toContain('N1G1X1\n');
+        expect(data(writes).filter(line => line === 'N1G1X1\n')).toHaveLength(1);
+        expect(controller.transport.failed).toBe(false);
+        expect(controller.transport.bytes).toBe(controller.transport.active.reduce((sum, request) => sum + request.bytes, 0));
+        expect(events.filter(entry => entry.event === 'workflow:state' && entry.args[0] === WORKFLOW_STATE_RUNNING)).toHaveLength(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
 
     test.each([
       [440.21, false],

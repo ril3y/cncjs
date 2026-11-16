@@ -970,9 +970,12 @@ class TinyGController {
             Date.now() - (this.spindlePollTime || 0) >= 1000) {
           this.spindlePollPending = true;
           this.spindlePollTime = Date.now();
-          this.transport.enqueue('{sso:null,ssc:null,sse:null}', { done: () => {
-            this.spindlePollPending = false;
-          } });
+          this.transport.enqueue('{sso:null,ssc:null,sse:null}', {
+            backgroundPoll: true,
+            done: () => {
+              this.spindlePollPending = false;
+            }
+          });
         }
 
         // Check if the machine has stopped movement after completion
@@ -1856,10 +1859,17 @@ class TinyGController {
     // ^d           Kill Job        Trigger ALARM to kill current job. Send {clear:n}, M2 or M30 to end ALARM state
     // ^x           Reset Board     Perform hardware reset to restart the board
     command(cmd, ...args) {
+      const startRequested = cmd === 'gcode:start' || cmd === 'start';
       if (this.observationOnly && !['reset', 'statusreport', 'feedhold', 'cyclestart', 'unlock'].includes(cmd)) {
+        if (startRequested) {
+          this.emit('serialport:read', 'Cannot start TinyG job: complete controller setup or Reset recovery first');
+        }
         return;
       }
       if (this.setup.running && !['reset', 'feedhold'].includes(cmd)) {
+        if (startRequested) {
+          this.emit('serialport:read', 'Cannot start TinyG job: wait for controller setup to finish');
+        }
         return;
       }
       const handler = {
@@ -1912,7 +1922,26 @@ class TinyGController {
           this.command('gcode:start');
         },
         'gcode:start': () => {
-          if (!this.ready || this.setup.running || this.transport.failed || this.transport.active.length || this.transport.pending.length) {
+          if (!this.ready || this.isClose() || this.transport.failed || this.transport.suspended) {
+            this.emit('serialport:read', 'Cannot start TinyG job: finish connecting or complete Reset recovery first');
+            return;
+          }
+          if (!this.workflow.isIdle()) {
+            this.emit('serialport:read', this.workflow.isPaused()
+              ? 'Cannot start TinyG job: use Resume to continue the paused job'
+              : 'Cannot start TinyG job: a job is already running');
+            return;
+          }
+          if (this.feederStop || this.transport.pauseThrough || this.toolChangePreparing ||
+              this.toolChangeActive || this.pendingToolChange || this.auxFencePending ||
+              this.stopProbePending || this.transport.motionBlocked || this.transport.fencing) {
+            this.emit('serialport:read', 'Cannot start TinyG job: resolve the current stop or tool change first');
+            return;
+          }
+          // A controller-owned read-only poll may overlap Start. Its reply still
+          // owns its bytes; the transport keeps ordinary command pacing intact.
+          if ([...this.transport.active, ...this.transport.pending].some(request => !request.backgroundPoll)) {
+            this.emit('serialport:read', 'Cannot start TinyG job: controller is busy; wait for the command to finish and press Start again');
             return;
           }
           this.event.trigger('gcode:start');
