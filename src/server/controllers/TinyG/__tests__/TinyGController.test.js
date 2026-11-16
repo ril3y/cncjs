@@ -1376,6 +1376,56 @@ describe('TinyGController', () => {
   });
 
   describe('recovery and state-preserving attachment', () => {
+    test.each(['first drain', 'reset drain', 'probe reply'])('driver error before %s invalidates every delayed recovery callback', async stage => {
+      const { controller, writes } = setupController();
+      const port = controller.options.port;
+      const connection = new SerialConnection({ path: port });
+      const driver = new EventEmitter();
+      const drains = [];
+      driver.isOpen = true;
+      driver.write = data => writes.push({ data });
+      driver.drain = done => drains.push(done);
+      driver.on('error', connection.eventListener.error);
+      connection.port = driver;
+      connection.on('error', controller.connectionEventListener.error);
+      connection.on('data', controller.connectionEventListener.data);
+      controller.connection = connection;
+      controller.runner.settings.fb = 450.06;
+      const init = jest.spyOn(controller, 'initController').mockImplementation(() => {});
+      controller.command('reset');
+      const tid = controller.recovery.tid;
+      if (stage !== 'first drain') {
+        drains.shift()(null);
+      }
+      if (stage === 'probe reply') {
+        connection.eventListener.data('{"sr":{"fb":450.06,"msg":"SYSTEM READY"}}');
+        drains.shift()(null);
+        expect(JSON.parse(data(writes)[1])).toMatchObject({ tid, fb: null, stat: null });
+      }
+      const beforeError = writes.length;
+      await new Promise(resolve => setImmediate(() => {
+        driver.emit('error', new Error('USB failed during reset recovery'));
+        resolve();
+      }));
+      while (drains.length) {
+        drains.shift()(null);
+      }
+      connection.eventListener.data('{"sr":{"fb":450.06,"msg":"SYSTEM READY"}}');
+      connection.eventListener.data(JSON.stringify({ tid, r: { fb: 450.06, stat: 1 }, f: [3, 0, 12] }));
+      controller.write('G1X999\n');
+      expect(controller.recovery).toBeNull();
+      expect(controller.transport.suspended).toBe(true);
+      expect(controller.ready).toBe(false);
+      expect(init).not.toHaveBeenCalled();
+      expect(writes).toHaveLength(beforeError);
+      const recreated = createController(TinyGController, { port });
+      controllers.push(recreated.controller);
+      await recreated.controller.initController();
+      recreated.controller.command('gcode', 'G1X999');
+      expect(recreated.controller.transport.suspended).toBe(true);
+      expect(recreated.writes).toHaveLength(0);
+    });
+
     test('asynchronous driver error quarantines queued writes through SerialConnection', async () => {
       const { controller, writes } = setupController();
       const connection = new SerialConnection({ path: controller.options.port });
