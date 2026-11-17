@@ -398,7 +398,10 @@ test.each([203, 204, 205, 206, 207])('recognized safety error %s revokes eligibi
   expect(controller.recoverable).toBe(true);
   reply({}, [3, code, 12], tid);
   expect(controller.recoverable).toBe(false);
+  controller.write('%');
+  expect(controller.recoverable).toBe(false);
   controller.command('recover');
+  expect(controller.recovery).toBeNull();
   expect(drains).toHaveLength(0);
 });
 
