@@ -73,6 +73,11 @@ const recoveryRequired = new Set();
 // An observed qr maximum during attachment is not proof of an empty planner.
 const legacyPlannerCapacity = (build) => ([440.21, 449.02].includes(build) ? 32 : 0);
 
+// Verified 450.06 RX_HEADERS and planner capacity. Recovery does not infer
+// either limit from an observed maximum while work may still be queued.
+const RECOVERY_RX_SLOTS = 12;
+const RECOVERY_PLANNER_SLOTS = 32;
+
 // Explicit flat getters do not depend on the user's persisted sr selection.
 // Keep each group small enough for both the wire limit and firmware JSON output.
 const TOOL_CONTEXT_GROUPS = [
@@ -155,6 +160,8 @@ class TinyGController {
     programEpoch = 0;
 
     recovery = null;
+
+    recoverable = false;
 
     transactionId = randomBytes(4).readUInt32BE(0);
 
@@ -292,8 +299,10 @@ class TinyGController {
 
       this.transport = new TinyGTransport(data => this.connection.write(data), message => {
         recoveryRequired.add(this.options.port);
+        this.recoverable = false;
         this.ready = false;
         this.sender.hold();
+        this.publishRecovery('required', message);
         this.emit('serialport:read', message);
       });
 
@@ -869,6 +878,10 @@ class TinyGController {
 
       this.runner.on('startup', () => {
         if (this.recovery) {
+          if (this.recovery.kind === 'operator') {
+            this.failRecovery('TinyG restarted during Recover; use Reset to establish a new connection state');
+            return;
+          }
           this.recovery.banner = true;
           this.probeRecovery();
           return;
@@ -879,6 +892,10 @@ class TinyGController {
 
       this.runner.on('response', data => {
         if (this.recovery) {
+          if (this.recovery.kind === 'operator') {
+            this.receiveOperatorRecovery(data);
+            return;
+          }
           const recovery = this.recovery;
           if (!recovery.probed || data.tid !== recovery.tid) {
             return;
@@ -891,6 +908,7 @@ class TinyGController {
           clearTimeout(recovery.timer);
           this.recovery = null;
           recoveryRequired.delete(this.options.port);
+          this.publishRecovery('idle', 'Reset verified; configuring TinyG');
           this.transport.resume();
           this.initController();
           return;
@@ -908,6 +926,10 @@ class TinyGController {
       this.runner.on('sr', (sr) => {
         if (sr.stat === 6) {
           this.cycleStartIssued = false;
+        }
+        if (sr.stat === TINYG_MACHINE_STATE_ALARM && !this.recovery && this.ready && this.lineMode &&
+            Number(this.runner.settings.fb) >= 450.06) {
+          this.quarantine(true);
         }
         // The board has left the ALARM state that rejected the connect-time setup
         if (!recoveryRequired.has(this.options.port) && this.setup.rejected && !this.setup.running && this.runner.isIdle()) {
@@ -1734,6 +1756,7 @@ class TinyGController {
     }
 
     close(callback) {
+      this.recoverable = false;
       if (this.recovery || this.transport.active.length || this.transport.pending.length || this.setup.running) {
         recoveryRequired.add(this.options.port);
       }
@@ -1860,9 +1883,14 @@ class TinyGController {
     // ^x           Reset Board     Perform hardware reset to restart the board
     command(cmd, ...args) {
       const startRequested = cmd === 'gcode:start' || cmd === 'start';
-      if (this.observationOnly && !['reset', 'statusreport', 'feedhold', 'cyclestart', 'unlock'].includes(cmd)) {
+      const recoveryInterrupt = this.recovery && (cmd === 'jogCancel' || (cmd === 'gcode:stop' && _.get(args, '[0].force')));
+      if (this.recovery && !recoveryInterrupt && !['reset', 'feedhold'].includes(cmd)) {
+        this.emit('serialport:read', 'TinyG recovery is in progress; wait for it to finish');
+        return;
+      }
+      if (this.observationOnly && !recoveryInterrupt && !['recover', 'reset', 'statusreport', 'feedhold', 'cyclestart', 'unlock'].includes(cmd)) {
         if (startRequested) {
-          this.emit('serialport:read', 'Cannot start TinyG job: complete controller setup or Reset recovery first');
+          this.emit('serialport:read', 'Cannot start TinyG job: complete controller setup or explicit recovery first');
         }
         return;
       }
@@ -1975,8 +2003,8 @@ class TinyGController {
               this.write('!');
               this.write('%');
             }
-            // Discarding input invalidates reply ownership. Reconnect is required
-            // before any new ordinary traffic; do not append M30 or a GET here.
+            // Discarding input invalidates reply ownership. Explicit recovery is
+            // required before new ordinary traffic; do not append M30 or a GET.
             return;
           }
 
@@ -2157,6 +2185,7 @@ class TinyGController {
         'unlock': () => {
           this.writeln('{clear:null}'); // alarm clear
         },
+        'recover': () => this.beginOperatorRecovery(),
         'reset': () => {
           this.workflow.stop();
           this.feeder.reset();
@@ -2535,7 +2564,12 @@ class TinyGController {
       handler();
     }
 
-    quarantine() {
+    quarantine(recoverable = false) {
+      if (this.recovery) {
+        clearTimeout(this.recovery.timer);
+      }
+      this.recovery = null;
+      this.recoverable = recoverable;
       this.setupGeneration++;
       this.pendingToolChange = false;
       this.toolChangePreparing = false;
@@ -2554,6 +2588,10 @@ class TinyGController {
       this.overridePending = {};
       this.overrideBusy = false;
       this.lineMode = false;
+      this.clearActionValues();
+      this.publishRecovery('required', recoverable
+        ? 'Job stopped. Recover before starting another job.'
+        : 'Connection state is uncertain. Use Reset before starting another job.');
     }
 
     failRecovery(message) {
@@ -2562,7 +2600,175 @@ class TinyGController {
       }
       this.recovery = null;
       this.quarantine();
+      this.publishRecovery('failed', message);
       this.emit('serialport:read', message);
+    }
+
+    publishRecovery(phase, message, step = null, reply = null) {
+      if (!this.runner) {
+        return;
+      }
+      this.runner.state = {
+        ...this.runner.state,
+        recovery: { phase, message, step, reply, canRecover: this.recoverable }
+      };
+      this.state = this.runner.state;
+      this.emit('controller:state', TINYG, this.state);
+      this.emit('TinyG:state', this.state);
+    }
+
+    beginOperatorRecovery() {
+      if (this.recovery) {
+        return;
+      }
+      const alarm = _.get(this.runner.state, 'sr.machineState') === TINYG_MACHINE_STATE_ALARM;
+      const eligible = this.recoverable || (alarm && this.ready && this.lineMode);
+      if (this.isClose() || !eligible || !Number.isFinite(Number(this.runner.settings.fb)) ||
+          Number(this.runner.settings.fb) < 450.06 ||
+          !this.connection.port || typeof this.connection.port.drain !== 'function') {
+        this.emit('serialport:read', 'Recover requires a configured TinyG 450.06 line-mode connection after Stop, queue flush, or ALARM. Use Reset for other connection faults.');
+        return;
+      }
+
+      // Cancel host ownership without replaying or resuming the interrupted job.
+      // Only a known discard boundary or configured ALARM may use this path;
+      // partial writes, disconnects and unexpected resets still require Reset.
+      this.quarantine(true);
+      this.sender.rewind();
+      this.sender.hold();
+      const recovery = { kind: 'operator', step: 'drain', tid: null };
+      this.recovery = recovery;
+      this.publishRecovery('running', 'Recovering: waiting for serial output', 'drain');
+      this.armOperatorRecoveryTimeout(recovery);
+      try {
+        this.connection.port.drain(error => {
+          if (this.recovery !== recovery || this.isClose()) {
+            return;
+          }
+          if (error) {
+            this.failOperatorRecovery(`serial output drain failed: ${error.message}`);
+            return;
+          }
+          // A fresh tagged status prevents stale cached ALARM from clearing a
+          // running/held board. All probes bypass ordinary suspended admission.
+          this.sendOperatorRecovery('state', { stat: null });
+        });
+      } catch (error) {
+        this.failOperatorRecovery(`serial output drain failed: ${error.message}`);
+      }
+    }
+
+    armOperatorRecoveryTimeout(recovery) {
+      clearTimeout(recovery.timer);
+      recovery.timer = setTimeout(() => {
+        if (this.recovery === recovery) {
+          this.failOperatorRecovery('timed out waiting for a matching reply');
+        }
+      }, 5000);
+    }
+
+    sendOperatorRecovery(step, fields) {
+      const recovery = this.recovery;
+      recovery.step = step;
+      recovery.tid = this.nextTransactionId();
+      const line = JSON.stringify({ tid: recovery.tid, ...fields }) + '\n';
+      this.publishRecovery('running', `Recovering: ${step}`, step);
+      this.armOperatorRecoveryTimeout(recovery);
+      try {
+        this.emit('serialport:write', line, { source: WRITE_SOURCE_CLIENT });
+        this.connection.write(line);
+      } catch (error) {
+        this.failRecovery(`TinyG Recover ${step}: serial write failed: ${error.message}; use Reset`);
+      }
+    }
+
+    failOperatorRecovery(reason, reply = null) {
+      const recovery = this.recovery;
+      if (!recovery || recovery.kind !== 'operator') {
+        return;
+      }
+      const { step } = recovery;
+      const message = `TinyG Recover ${step} failed: ${reason}. Admission remains blocked.`;
+      this.quarantine(true);
+      this.publishRecovery('failed', message, step, reply);
+      this.emit('serialport:read', message + (reply ? ` Reply: ${JSON.stringify(reply)}` : ''));
+    }
+
+    receiveOperatorRecovery(data) {
+      const recovery = this.recovery;
+      if (recovery.tid === null || data.tid !== recovery.tid) {
+        return; // Old owners, duplicate steps and unsolicited status cannot unlock.
+      }
+      const { r, f } = data;
+      const expectedStatus = recovery.step === 'input' && recovery.alarm ? 204 : 0;
+      if (!r || !Array.isArray(f) || f[0] !== 3 || f[1] !== expectedStatus ||
+          !Number.isInteger(f[2]) || f[2] < 0 || f[2] > RECOVERY_RX_SLOTS) {
+        this.failOperatorRecovery(`expected line-mode status ${expectedStatus} with valid credits`, data);
+        return;
+      }
+      if (recovery.step === 'state') {
+        if (![1, 2, 3, 4].includes(r.stat)) {
+          this.failOperatorRecovery('board is not idle or in ALARM', data);
+          return;
+        }
+        recovery.alarm = r.stat === TINYG_MACHINE_STATE_ALARM;
+        // A pure gc+tid M400 is DATA, not a priority getter. Its own reply
+        // fences old DATA before clearing ALARM (where it must reject with 204).
+        // An idle status or free-slot count alone cannot prove that boundary.
+        this.sendOperatorRecovery('input', { gc: 'M400' });
+      } else if (recovery.step === 'input') {
+        if (r.gc !== 'M400') {
+          this.failOperatorRecovery('missing ordered input barrier result', data);
+          return;
+        }
+        this.sendOperatorRecovery(recovery.alarm ? 'clear' : 'rx', recovery.alarm ? { clear: null } : { rx: null });
+      } else if (recovery.step === 'clear') {
+        if (!Object.prototype.hasOwnProperty.call(r, 'clear')) {
+          this.failOperatorRecovery('missing alarm-clear result', data);
+          return;
+        }
+        this.sendOperatorRecovery('rx', { rx: null });
+      } else if (recovery.step === 'rx') {
+        if (!Number.isInteger(r.rx) || r.rx < 1 || r.rx > RECOVERY_RX_SLOTS) {
+          this.failOperatorRecovery('invalid free-line count', data);
+          return;
+        }
+        recovery.slots = Math.min(r.rx, f[2]);
+        this.sendOperatorRecovery('status', { sr: null });
+      } else if (recovery.step === 'status') {
+        if (![1, 3, 4].includes(_.get(r, 'sr.stat'))) {
+          this.failOperatorRecovery('expected a fresh READY, STOP or END status report', data);
+          return;
+        }
+        // Keep the full report separate: the parser handles qr before sr, and
+        // firmware group expansion must not hide the planner proof.
+        this.sendOperatorRecovery('planner', { stat: null, qr: null });
+      } else if (recovery.step === 'planner') {
+        if (![1, 3, 4].includes(r.stat) || r.qr !== RECOVERY_PLANNER_SLOTS) {
+          this.failOperatorRecovery('expected READY, STOP or END and an empty planner (qr 32)', data);
+          return;
+        }
+        clearTimeout(recovery.timer);
+        this.recovery = null;
+        this.recoverable = false;
+        this.transport.lineMode = true;
+        this.lineMode = true;
+        this.transport.slots = Math.min(recovery.slots, f[2]);
+        this.sender.setStreamingProtocol(SP_TYPE_LINE_COUNTING, { reserve: TINYG_LINE_MODE_RESERVE });
+        this.sender.sp.freeSlots = this.transport.slots;
+        this.transport.resume();
+        recoveryRequired.delete(this.options.port);
+        this.setup.rejected = false;
+        this.observationOnly = false;
+        this.ready = true;
+        this.runner.state = {
+          ...this.runner.state,
+          sr: { ...this.runner.state.sr, machineState: r.stat },
+          qr: r.qr
+        };
+        this.publishRecovery('idle', 'Recovery complete. Ready for a new job.');
+        this.emit('serialport:read', 'TinyG recovery complete. The interrupted job has not been resumed.');
+      }
     }
 
     nextTransactionId() {
@@ -2642,6 +2848,10 @@ class TinyGController {
         log.error(`Serial port "${this.options.port}" is not accessible`);
         return;
       }
+      if (this.recovery && !['!', '\x04', '%', '\x18'].includes(String(data).trim())) {
+        this.emit('serialport:read', 'TinyG recovery is in progress; ordinary commands are blocked');
+        return;
+      }
       if (String(data).trim() === '!') {
         this.cycleStartIssued = false;
       }
@@ -2679,8 +2889,9 @@ class TinyGController {
           return;
         }
         if (['\x04', '%'].includes(data.trim())) {
-          this.quarantine();
-          this.emit('serialport:read', 'TinyG input discarded; explicit Reset recovery is required');
+          const recoverable = this.recoverable || (this.ready && this.lineMode && Number(this.runner.settings.fb) >= 450.06);
+          this.quarantine(recoverable);
+          this.emit('serialport:read', 'TinyG input discarded; use Recover before starting another job');
         }
         this.connection.write(data.trim());
         return;

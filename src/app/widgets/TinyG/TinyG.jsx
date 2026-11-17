@@ -49,6 +49,10 @@ class TinyG extends PureComponent {
       controller.command('energizeMotors:off');
     };
 
+    recover = () => {
+      controller.command('recover');
+    };
+
     render() {
       const { state, actions } = this.props;
       const none = '–';
@@ -59,6 +63,11 @@ class TinyG extends PureComponent {
       const ovS = fb >= 450.06 ? Math.round((ssc ?? 1) * 100) : 0;
       const pwr = get(controllerState, 'pwr');
       const machineState = get(controllerState, 'sr.machineState');
+      const recovery = get(controllerState, 'recovery', {});
+      const recovering = recovery.phase === 'running';
+      const alarm = machineState === TINYG_MACHINE_STATE_ALARM;
+      const canRecover = state.canClick && !recovering && recovery.canRecover;
+      const recoveryNotice = alarm || ['required', 'running', 'failed'].includes(recovery.phase);
       const machineStateText = {
         [TINYG_MACHINE_STATE_INITIALIZING]: i18n.t('controller:TinyG.machineState.initializing'),
         [TINYG_MACHINE_STATE_READY]: i18n.t('controller:TinyG.machineState.ready'),
@@ -86,6 +95,29 @@ class TinyG extends PureComponent {
 
       return (
         <div>
+          <Button
+            btnStyle="flat"
+            onClick={this.recover}
+            disabled={!canRecover}
+            title={i18n._('Recover the controller before starting a new job')}
+          >
+            {recovering ? i18n._('Recovering…') : i18n._('Recover')}
+          </Button>
+          {recoveryNotice && (
+            <div className="alert alert-warning" role="alert" style={{ marginTop: 10 }}>
+              <p>{recovery.message || i18n._('TinyG is in ALARM. Use Reset to establish a configured connection.')}</p>
+              <p>{i18n._('Recovery discards pending commands. It does not resume the interrupted job.')}</p>
+              {recovery.reply && (
+                <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                  {JSON.stringify(recovery.reply)}
+                </pre>
+              )}
+              <Button btnStyle="flat" onClick={this.recover} disabled={!canRecover}>
+                {recovering ? i18n._('Recovering…') : i18n._('Recover')}
+              </Button>
+            </div>
+          )}
+          {recovery.phase === 'idle' && <p role="status">{recovery.message}</p>}
           <Overrides ovF={ovF} ovS={ovS} />
           {mfe === 0 && <div>Feed override disabled by program or operator</div>}
           {sse === 0 && <div>Spindle override disabled by program or operator</div>}
