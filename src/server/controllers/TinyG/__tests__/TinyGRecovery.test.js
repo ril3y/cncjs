@@ -46,25 +46,20 @@ const toStatus = () => {
   reply({ rx: 12 });
 };
 
-test.each(['%', '\x04'])('explicit Recover after %p drops old host owners and starts only a separately requested job', command => {
+test('explicit Recover with an acknowledged wire stream starts only a separately requested job', () => {
   controller.command('gcode:load', 'old.nc', 'G1X1\nG1X2\nG1X3');
-  controller.command('gcode:start');
-  expect(controller.transport.active.length).toBeGreaterThan(0);
-  begin(command);
+  // The loaded job has not been sent; only unsent host work can be discarded.
+  expect(controller.transport.active).toHaveLength(0);
+  begin();
   expect(controller.transport.active).toHaveLength(0);
   expect(controller.transport.pending).toHaveLength(0);
   expect(controller.sender.state.sent).toBe(0);
   expect(controller.sender.state.received).toBe(0);
   const tids = [last().tid];
-  reply({ stat: command === '\x04' ? 2 : 3 });
+  reply({ stat: 3 });
   expect(last()).toMatchObject({ gc: 'M400' });
   tids.push(last().tid);
-  reply({ gc: 'M400' }, [3, command === '\x04' ? 204 : 0, 12]);
-  if (command === '\x04') {
-    expect(last()).toMatchObject({ clear: null });
-    tids.push(last().tid);
-    reply({ clear: null });
-  }
+  reply({ gc: 'M400' });
   expect(last()).toMatchObject({ rx: null });
   tids.push(last().tid);
   reply({ rx: 12 }, [3, 0, 11]);
@@ -114,7 +109,7 @@ test('recovery waits for the output boundary, and ignores untagged, stale and du
   expect(controller.ready).toBe(true);
 });
 
-test.each([0, 5, 6, 7, 9, 10, 11, 12, 13, null])('fresh state %p cannot clear an alarm or unlock', stat => {
+test.each([0, 2, 5, 6, 7, 9, 10, 11, 12, 13, null])('fresh state %p cannot clear an alarm or unlock', stat => {
   begin();
   reply({ stat });
   expect(controller.recovery).toBeNull();
@@ -153,21 +148,12 @@ test.each([[2, 0, 12], [3, 204, 12], [3, 0, -1], [3, 0, '12'], [3, 0]].map(f => 
   expect(controller.runner.state.recovery).toMatchObject({ phase: 'failed', step: 'state' });
 });
 
-test('clear requires its own matching result and surfaces firmware rejection', () => {
-  begin('\x04');
-  reply({ stat: 2 });
-  reply({ gc: 'M400' }, [3, 204, 12]);
-  reply({ clear: null }, [3, 204, 12]);
-  expect(controller.runner.state.recovery).toMatchObject({ phase: 'failed', step: 'clear', reply: { f: [3, 204, 12] } });
-  expect(controller.ready).toBe(false);
-});
-
-test.each(['drain', 'state', 'input', 'clear', 'rx', 'status', 'planner'])('%s timeout cannot unlock and can be explicitly retried with new tags', step => {
+test.each(['drain', 'state', 'input', 'rx', 'status', 'planner'])('%s timeout cannot unlock and can be explicitly retried with new tags', step => {
   controller.write('%');
   controller.command('recover');
   if (step !== 'drain') drains.shift()(null);
-  if (['input', 'clear', 'rx', 'status', 'planner'].includes(step)) reply({ stat: step === 'clear' ? 2 : 3 });
-  if (['clear', 'rx', 'status', 'planner'].includes(step)) reply({ gc: 'M400' }, [3, step === 'clear' ? 204 : 0, 12]);
+  if (['input', 'rx', 'status', 'planner'].includes(step)) reply({ stat: 3 });
+  if (['rx', 'status', 'planner'].includes(step)) reply({ gc: 'M400' }, [3, 0, 12]);
   if (['status', 'planner'].includes(step)) reply({ rx: 12 });
   if (step === 'planner') reply({ sr: { stat: 3 } });
   const oldTid = controller.recovery.tid;
@@ -243,15 +229,14 @@ test.each([{ stat: 2, qr: 32 }, { stat: 5, qr: 32 }, { stat: 6, qr: 32 },
   expect(controller.runner.state.recovery).toMatchObject({ phase: 'failed', step: 'planner', reply: { r } });
 });
 
-test.each([{ gc: 'M400', status: 0 }, { gc: 'G1X1', status: 204 }])('ALARM input fence requires its exact rejected reply %p', ({ gc, status }) => {
-  begin('\x04');
-  reply({ stat: 2 });
+test.each([{ gc: 'M400', status: 204 }, { gc: 'G1X1', status: 0 }])('input fence rejects unexpected result %p', ({ gc, status }) => {
+  begin();
+  reply({ stat: 3 });
   reply({ gc }, [3, status, 12]);
   expect(controller.ready).toBe(false);
   expect(controller.runner.state.recovery).toMatchObject({ phase: 'failed', step: 'input' });
   expect(writes.some(({ data }) => data.includes('clear'))).toBe(false);
 });
-
 
 test.each(['error', 'reset', 'stop', 'flush', 'destroy'])('%s cancels an outstanding output drain', action => {
   controller.write('%');
@@ -267,12 +252,12 @@ test.each(['error', 'reset', 'stop', 'flush', 'destroy'])('%s cancels an outstan
   expect(writes).toHaveLength(count);
 });
 
-test('configured ALARM exposes Recover without automatically writing recovery commands', () => {
+test('configured ALARM requires explicit Reset without writing recovery commands', () => {
   const count = writes.length;
   controller.runner.parse('{"sr":{"stat":2}}');
   expect(writes).toHaveLength(count);
   expect(controller.ready).toBe(false);
-  expect(controller.runner.state.recovery).toMatchObject({ phase: 'required', canRecover: true });
+  expect(controller.runner.state.recovery).toMatchObject({ phase: 'required', canRecover: false });
   expect(controller.recovery).toBeNull();
 });
 
@@ -298,4 +283,69 @@ test.each(['gcode:stop', 'jogCancel'])('%s can interrupt recovery through the UI
   const count = writes.length;
   reply({ stat: 3 }, [3, 0, 12], oldTid);
   expect(writes).toHaveLength(count);
+});
+
+test.each(['command', 'raw'])('Feed Hold via %s cancels recovery before a delayed barrier reply', path => {
+  begin();
+  reply({ stat: 3 });
+  const tid = last().tid;
+  if (path === 'command') controller.command('feedhold');
+  else controller.write('!');
+  const count = writes.length;
+  reply({ gc: 'M400' }, [3, 0, 12], tid);
+  expect(controller.recovery).toBeNull();
+  expect(writes).toHaveLength(count);
+  expect(controller.ready).toBe(false);
+});
+
+
+test.each(['\x04', '%'])('pending M30 followed by motion requires Reset after %p', action => {
+  // 450.06 keeps DATA after ^D; M30 clears ALARM before the alarm gate and
+  // could make the next move executable. % may be ignored. Neither action
+  // authorizes sending a fence that drains this backlog.
+  controller.transport.enqueue('N1M30', { n: 1 });
+  controller.transport.enqueue('N2G1X100', { n: 2 });
+  expect(controller.transport.active).toHaveLength(2);
+  controller.write(action);
+  const count = writes.length;
+  controller.command('recover');
+  expect(drains).toHaveLength(0);
+  expect(writes).toHaveLength(count);
+  expect(controller.runner.state.recovery).toMatchObject({ canRecover: false });
+  expect(controller.ready).toBe(false);
+});
+
+test('even a benign outstanding GET prevents treating an ignored % as a proven discard', () => {
+  controller.transport.enqueue('{"sr":null}');
+  expect(controller.transport.active.length).toBeGreaterThan(0);
+  controller.write('%');
+  controller.command('recover');
+  expect(drains).toHaveLength(0);
+  expect(controller.ready).toBe(false);
+});
+
+test('Stop with no outstanding wire commands still requires explicit Reset', () => {
+  controller.write('\x04');
+  controller.command('recover');
+  expect(writes.map(({ data }) => data)).toEqual(['\x04']);
+  expect(controller.runner.state.recovery.canRecover).toBe(false);
+});
+
+test.each([2, 12, 13])('a newer safety state %s cannot be cleared by Recover', stat => {
+  toStatus();
+  const count = writes.length;
+  reply({ sr: { stat } });
+  expect(writes).toHaveLength(count);
+  expect(controller.ready).toBe(false);
+  expect(writes.some(({ data }) => data.includes('clear'))).toBe(false);
+});
+
+
+test('widget queue-flush command stops host workflow without introducing a new GET owner', () => {
+  controller.command('jogCancel');
+  expect(writes.map(({ data }) => data)).toEqual(['!', '%']);
+  expect(controller.workflow.isIdle()).toBe(true);
+  expect(controller.runner.state.recovery.canRecover).toBe(true);
+  controller.command('recover');
+  expect(drains).toHaveLength(1);
 });

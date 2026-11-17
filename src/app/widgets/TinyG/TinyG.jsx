@@ -106,7 +106,7 @@ class TinyG extends PureComponent {
           {recoveryNotice && (
             <div className="alert alert-warning" role="alert" style={{ marginTop: 10 }}>
               <p>{recovery.message || i18n._('TinyG is in ALARM. Use Reset to establish a configured connection.')}</p>
-              <p>{i18n._('Recovery discards pending commands. It does not resume the interrupted job.')}</p>
+              <p>{i18n._('Recovery drops pending host commands and verifies readiness. It does not resume the interrupted job.')}</p>
               {recovery.reply && (
                 <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                   {JSON.stringify(recovery.reply)}

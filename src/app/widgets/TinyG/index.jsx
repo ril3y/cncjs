@@ -297,8 +297,7 @@ class TinyGWidget extends PureComponent {
                   </Widget.DropdownMenuItem>
                   <Widget.DropdownMenuItem
                     onSelect={() => {
-                      controller.command('gcode:stop');
-                      controller.command('jogCancel'); // ordered hold and queue flush
+                      controller.command('jogCancel'); // ! then %; quarantine stops host refill
                     }}
                     disabled={!state.canClick}
                   >
