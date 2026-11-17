@@ -349,3 +349,88 @@ test('widget queue-flush command stops host workflow without introducing a new G
   controller.command('recover');
   expect(drains).toHaveLength(1);
 });
+
+test.each([2, 12, 13])('safety state %s latches Reset at either final verification step', stat => {
+  toStatus();
+  reply({ sr: { stat } });
+  expect(controller.recoverable).toBe(false);
+  expect(controller.runner.state.recovery.canRecover).toBe(false);
+});
+
+test.each([2, 12, 13])('planner safety state %s latches Reset across retry and another flush', stat => {
+  toStatus();
+  reply({ sr: { stat: 3 } });
+  reply({ stat, qr: 32 });
+  expect(controller.recoverable).toBe(false);
+  controller.runner.parse('{"sr":{"stat":3}}'); // A later idle report cannot remove the latch.
+  controller.write('%');
+  controller.command('recover');
+  expect(controller.recovery).toBeNull();
+  expect(drains).toHaveLength(0);
+});
+
+test.each(['drain', 'input', 'status'])('unsolicited safety report at %s cancels all future steps', step => {
+  controller.write('%');
+  controller.command('recover');
+  if (step !== 'drain') {
+    drains.shift()(null);
+    reply({ stat: 3 });
+  }
+  if (step === 'status') {
+    reply({ gc: 'M400' });
+    reply({ rx: 12 });
+  }
+  const tid = controller.recovery.tid;
+  controller.runner.parse('{"sr":{"stat":12}}');
+  expect(controller.recoverable).toBe(false);
+  expect(controller.recovery).toBeNull();
+  const count = writes.length;
+  while (drains.length) drains.shift()(null);
+  reply({ stat: 3, qr: 32 }, [3, 0, 12], tid);
+  expect(writes).toHaveLength(count);
+  expect(controller.ready).toBe(false);
+});
+
+test.each([203, 204, 205, 206, 207])('recognized safety error %s revokes eligibility even after timeout', code => {
+  begin();
+  const tid = last().tid;
+  jest.advanceTimersByTime(5001);
+  expect(controller.recoverable).toBe(true);
+  reply({}, [3, code, 12], tid);
+  expect(controller.recoverable).toBe(false);
+  controller.command('recover');
+  expect(drains).toHaveLength(0);
+});
+
+test('asynchronous safety exception revokes eligibility while awaiting output drain', () => {
+  controller.write('%');
+  controller.command('recover');
+  controller.runner.parse('{"er":{"st":205,"msg":"shutdown"}}');
+  expect(controller.recoverable).toBe(false);
+  expect(controller.recovery).toBeNull();
+  drains.shift()(null);
+  expect(writes.map(({ data }) => data)).toEqual(['%']);
+});
+
+
+test.each([12, 13])('safety state %s outside an attempt cannot acquire eligibility through flush', stat => {
+  controller.runner.parse(JSON.stringify({ sr: { stat } }));
+  expect(controller.ready).toBe(false);
+  controller.write('%');
+  controller.command('recover');
+  expect(controller.recoverable).toBe(false);
+  expect(drains).toHaveLength(0);
+});
+
+test('explicit Reset keeps its own epoch while old safety replies arrive', () => {
+  begin();
+  const oldTid = last().tid;
+  controller.command('reset');
+  while (drains.length) drains.shift()(null);
+  controller.runner.parse('{"sr":{"fb":450.06,"msg":"SYSTEM READY"}}');
+  const reset = controller.recovery;
+  reply({}, [3, 205, 12], oldTid);
+  controller.runner.parse('{"sr":{"stat":12}}');
+  expect(controller.recovery).toBe(reset);
+  expect(controller.recoverable).toBe(false);
+});

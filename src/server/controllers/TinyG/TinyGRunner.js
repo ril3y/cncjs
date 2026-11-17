@@ -169,6 +169,10 @@ class TinyGRunner extends events.EventEmitter {
           return;
         }
 
+        // Observe safety information before parser precedence can hide an sr
+        // behind qr, or before a correlated reply advances controller admission.
+        this.emit('frame', data);
+
         const successful = !data.f || data.f[1] === 0;
         const feedEvent = data.ov && data.ov.v === 1 ? _.pick(data.ov, ['mfo', 'mfc', 'mfe']) : {};
         let overrideValues = {};

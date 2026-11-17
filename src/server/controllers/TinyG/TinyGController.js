@@ -890,6 +890,8 @@ class TinyGController {
         this.emit('serialport:read', 'TinyG restarted; explicit Reset recovery is required');
       });
 
+      this.runner.on('frame', data => this.observeRecoverySafety(data));
+
       this.runner.on('response', data => {
         if (this.recovery) {
           if (this.recovery.kind === 'operator') {
@@ -926,10 +928,6 @@ class TinyGController {
       this.runner.on('sr', (sr) => {
         if (sr.stat === 6) {
           this.cycleStartIssued = false;
-        }
-        if (sr.stat === TINYG_MACHINE_STATE_ALARM && !this.recovery && this.ready && this.lineMode &&
-            Number(this.runner.settings.fb) >= 450.06) {
-          this.quarantine();
         }
         // The board has left the ALARM state that rejected the connect-time setup
         if (!recoveryRequired.has(this.options.port) && this.setup.rejected && !this.setup.running && this.runner.isIdle()) {
@@ -2692,6 +2690,36 @@ class TinyGController {
       this.quarantine(retry);
       this.publishRecovery('failed', message, step, reply);
       this.emit('serialport:read', message + (reply ? ` Reply: ${JSON.stringify(reply)}` : ''));
+    }
+
+    observeRecoverySafety(data) {
+      // Explicit Reset has its own banner/probe epoch. Old safety reports must
+      // not cancel that requested reset; its matching probe still requires idle.
+      if (this.recovery && this.recovery.kind !== 'operator') {
+        return;
+      }
+      if (!this.recoverable && !this.recovery &&
+          !(this.ready && this.lineMode && Number(this.runner.settings.fb) >= 450.06)) {
+        return;
+      }
+      const safetyStates = [2, 12, 13]; // ALARM, SHUTDOWN, PANIC
+      const safetyErrors = [203, 204, 205, 206, 207]; // limit/rejected/kill
+      const unsafe = ['sr.stat', 'r.sr.stat', 'r.stat'].some(key => safetyStates.includes(_.get(data, key))) ||
+        (Array.isArray(data.f) && safetyErrors.includes(data.f[1])) ||
+        safetyErrors.includes(_.get(data, 'er.st'));
+      if (!unsafe) {
+        return;
+      }
+      const message = 'Safety state reported; explicit Reset is required';
+      // Unlike successful admission, revoking permission does not require a
+      // current tag: late and unsolicited safety reports must also latch it.
+      if (this.recovery) {
+        this.failOperatorRecovery(message, data, false);
+      } else {
+        this.quarantine();
+        this.publishRecovery('required', message, 'safety', data);
+        this.emit('serialport:read', message);
+      }
     }
 
     receiveOperatorRecovery(data) {

@@ -17,6 +17,8 @@ Recover after queue flush is therefore enabled only on a configured 450.06 line-
 5. Read full `sr`, requiring READY, STOP or END; then separately read flat `stat` and `qr`, again requiring an idle state and all 32 planner slots free.
 6. Seed line credits conservatively from the RX result and subsequent footer credits, then allow a separately requested job start. Old replies never credit canceled owners.
 
+Any observed ALARM/SHUTDOWN/PANIC or recognized safety error latches the explicit Reset requirement, even if unsolicited or received after a timeout. Later idle reports, retries and another `%` cannot remove that latch. The explicit Reset path retains its own banner/probe epoch.
+
 Each step has a five-second deadline and its own transaction ID. Failure leaves admission blocked and shows the step and available reply. Feed Hold (command or raw `!`), forced Stop, queue flush, Reset and connection faults invalidate the attempt; delayed replies/drain callbacks cannot advance it. Cancellation cannot revoke requests already transmitted to the board. These recovery requests do not clear alarms or execute motion.
 
 ## Why the restriction exists
